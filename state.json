@@ -1,0 +1,11 @@
+{
+  "queries": [
+    "めろん",
+    "",
+    ""
+  ],
+  "counter": 0,
+  "performanceActive": false,
+  "permanent": false,
+  "serviceTemplate": "https://www.google.com/search?q={query}"
+}

@@ -1,0 +1,18 @@
+# Render.com 用（無料Webサービス）
+# GitHub にこのフォルダをプッシュ → Render で New + Blueprint → この repo を選ぶ
+services:
+  - type: web
+    name: qr-magic
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: PUBLIC_TOKEN
+        sync: false

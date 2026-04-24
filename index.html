@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QR Magic（個人用）</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.2/Sortable.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #111; background: #f4f4f5; }
+    body { margin: 0 auto; max-width: 520px; padding: 1rem 1rem 3rem; }
+    h1 { font-size: 1.15rem; margin: 0 0 0.75rem; }
+    h2 { font-size: 0.95rem; margin: 1.25rem 0 0.5rem; }
+    input[type="text"], input[type="password"], textarea {
+      width: 100%; box-sizing: border-box; padding: 0.5rem; font-size: 1rem; border: 1px solid #ccc; border-radius: 6px;
+    }
+    textarea { min-height: 2.5rem; resize: vertical; }
+    button {
+      cursor: pointer; border: none; border-radius: 8px; padding: 0.65rem 1rem; font-size: 0.95rem; font-weight: 600;
+    }
+    .btn-primary { background: #2563eb; color: #fff; }
+    .btn-secondary { background: #e4e4e7; color: #18181b; }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-warn { background: #ea580c; color: #fff; }
+    .row { display: flex; gap: 0.35rem; align-items: center; margin-bottom: 0.4rem; background: #fff; padding: 0.35rem; border-radius: 8px; border: 1px solid #e4e4e7; }
+    .handle { cursor: grab; user-select: none; padding: 0 0.35rem; color: #71717a; font-size: 1.1rem; }
+    .row input { flex: 1; }
+    .check { font-size: 0.8rem; padding: 0.35rem 0.5rem; background: #eef2ff; color: #3730a3; border-radius: 6px; white-space: nowrap; }
+    .panel { background: #fff; border-radius: 10px; padding: 0.85rem; border: 1px solid #e4e4e7; margin-top: 0.75rem; }
+    #qr { display: flex; justify-content: center; margin-top: 0.5rem; }
+    #perf { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.55); align-items: center; justify-content: center; z-index: 50; }
+    #perf .box { background: #fff; padding: 1.25rem; border-radius: 12px; max-width: 90%; }
+    .muted { color: #71717a; font-size: 0.85rem; word-break: break-all; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+    #cardModal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 60; align-items: flex-end; justify-content: center; }
+    #cardModal .sheet { background: #fff; width: 100%; max-width: 520px; border-radius: 12px 12px 0 0; padding: 0.75rem; max-height: 85vh; overflow: auto; }
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.35rem; }
+    .grid div { text-align: center; padding: 0.45rem; border-radius: 8px; background: #f4f4f5; border: 1px solid #d4d4d8; cursor: pointer; font-size: 0.9rem; }
+    .grid div:active { transform: scale(0.98); }
+    .info { font-size: 0.8rem; color: #52525b; margin-top: 0.35rem; }
+  </style>
+</head>
+<body>
+  <h1>QR Magic（個人用）</h1>
+  <p class="muted">アカウントはありません。<code>ADMIN_TOKEN</code> を知っている人だけが設定できます。観客用URLは下に表示されます。</p>
+
+  <div id="gate" class="panel">
+    <h2>管理用トークン</h2>
+    <p class="muted">サーバーの環境変数 <code>ADMIN_TOKEN</code> と同じ文字列を入力してください。</p>
+    <input type="password" id="gateToken" placeholder="ADMIN_TOKEN" autocomplete="off" />
+    <div class="toolbar" style="margin-top:0.65rem">
+      <button type="button" class="btn-primary" id="gateBtn">開く</button>
+    </div>
+  </div>
+
+  <div id="app" style="display:none">
+    <div class="panel">
+      <h2>観客用QR（このURLをQR化）</h2>
+      <p class="muted" style="font-size:.82rem">インターネット用は <code>npm.cmd run public</code> で起動すると自動で入ります。手動なら .env の <code>PUBLIC_BASE_URL</code> でも可。</p>
+      <p id="publicUrl" class="muted"></p>
+      <div id="qr"></div>
+    </div>
+
+    <div class="panel">
+      <h2>リダイレクトURLのテンプレート</h2>
+      <p class="muted">必ず <code>{query}</code> を含めてください。任意で <code>{host}</code>。</p>
+      <textarea id="template"></textarea>
+    </div>
+
+    <div class="panel">
+      <h2>キーワード（ドラッグの≡で並べ替え）</h2>
+      <div id="rows"></div>
+      <div class="toolbar">
+        <button type="button" class="btn-secondary" id="addRow">行を追加</button>
+        <button type="button" class="btn-primary" id="saveBtn">設定を保存</button>
+        <button type="button" class="btn-secondary" id="resetCounter">カウンタだけ0に</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>現在の状態</h2>
+      <p id="statusLine" class="muted"></p>
+      <ul id="preview"></ul>
+    </div>
+
+    <div class="toolbar">
+      <button type="button" class="btn-warn" id="btnPerform">パフォーマンス</button>
+      <button type="button" class="btn-warn" id="btnPermanent">永続化パフォーマンス</button>
+    </div>
+    <p class="info">通常: 終了後カウンタ0に。永続化: 終了後もカウンタ維持（使い回しはしにくくなります）。</p>
+  </div>
+
+  <div id="perf">
+    <div class="box">
+      <strong>パフォーマンス中</strong>
+      <p id="perfText" class="muted" style="margin:0.75rem 0"></p>
+      <button type="button" class="btn-primary" id="btnFinish">終了</button>
+    </div>
+  </div>
+
+  <div id="cardModal">
+    <div class="sheet">
+      <p style="margin:0 0 0.5rem"><strong>カード</strong> <span id="cardInfo" class="muted"></span></p>
+      <div class="grid" id="marks" style="margin-bottom:0.5rem">
+        <div data-m="S">♠</div><div data-m="D">♦</div><div data-m="C">♣</div><div data-m="H">♥</div>
+      </div>
+      <div class="grid" id="nums" style="grid-template-columns:repeat(5,1fr);margin-bottom:0.5rem"></div>
+      <div class="grid" id="orders" style="grid-template-columns:repeat(5,1fr);margin-bottom:0.5rem"></div>
+      <div class="toolbar">
+        <button type="button" class="btn-secondary" id="cardClose">閉じる</button>
+        <button type="button" class="btn-danger" id="cardClear">この行を空に</button>
+      </div>
+      <p class="info">スート・数字・順を選ぶと <code>S5/3</code> の形式で入ります。Joはジョーカー。</p>
+    </div>
+  </div>
+
+  <p id="toast" style="display:none;position:fixed;bottom:1rem;left:50%;transform:translateX(-50%);background:#111;color:#fff;padding:.6rem 1rem;border-radius:8px;z-index:100"></p>
+
+  <script>
+    const LS = "qr_magic_admin_token";
+    const gate = document.getElementById("gate");
+    const appEl = document.getElementById("app");
+
+    let adminToken = localStorage.getItem(LS) || "";
+    let state = null;
+    let publicPath = "";
+    /** サーバー .env の PUBLIC_BASE_URL（https の観客用オリジン） */
+    let publicBaseUrl = "";
+    let sortable = null;
+    let cardRow = -1;
+    let pick = { m: "", n: "", o: "" };
+
+    function toast(msg) {
+      const t = document.getElementById("toast");
+      t.textContent = msg;
+      t.style.display = "block";
+      setTimeout(() => { t.style.display = "none"; }, 2200);
+    }
+
+    function authHeaders() {
+      return { Authorization: "Bearer " + adminToken, "Content-Type": "application/json" };
+    }
+
+    async function api(path, opt = {}) {
+      const r = await fetch(path, { ...opt, headers: { ...authHeaders(), ...opt.headers } });
+      if (r.status === 401) {
+        localStorage.removeItem(LS);
+        location.reload();
+        throw new Error("unauthorized");
+      }
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.message || r.statusText);
+      return j;
+    }
+
+    function audienceOrigin() {
+      return (publicBaseUrl && publicBaseUrl.length > 0 ? publicBaseUrl : location.origin).replace(/\/+$/, "");
+    }
+
+    function buildUrl(template, query) {
+      const host = audienceOrigin();
+      return template.replaceAll("{host}", host).replaceAll("{query}", encodeURIComponent(query));
+    }
+
+    function renderRows() {
+      const wrap = document.getElementById("rows");
+      wrap.innerHTML = "";
+      (state.queries || []).forEach((q, i) => {
+        const row = document.createElement("div");
+        row.className = "row";
+        row.dataset.index = String(i);
+        row.innerHTML =
+          '<span class="handle" title="並べ替え">≡</span>' +
+          '<input type="text" value="' + escapeAttr(q) + '" data-i="' + i + '" />' +
+          '<button type="button" class="check" data-check="' + i + '">CHECK</button>' +
+          '<button type="button" class="btn-secondary" style="padding:.35rem .5rem;font-size:.8rem" data-card="' + i + '">カード</button>' +
+          '<button type="button" class="btn-danger" style="padding:.35rem .5rem;font-size:.8rem" data-del="' + i + '">削除</button>';
+        wrap.appendChild(row);
+      });
+      wrap.querySelectorAll("input[type=text]").forEach((inp) => {
+        inp.addEventListener("input", () => {
+          const i = +inp.dataset.i;
+          state.queries[i] = inp.value;
+        });
+      });
+      wrap.querySelectorAll("[data-check]").forEach((b) => {
+        b.addEventListener("click", () => {
+          const i = +b.getAttribute("data-check");
+          const q = (state.queries[i] || "").trim();
+          if (!q) return toast("キーワードが空です");
+          window.open(buildUrl(state.serviceTemplate, q), "_blank");
+        });
+      });
+      wrap.querySelectorAll("[data-card]").forEach((b) => {
+        b.addEventListener("click", () => openCard(+b.getAttribute("data-card")));
+      });
+      wrap.querySelectorAll("[data-del]").forEach((b) => {
+        b.addEventListener("click", () => {
+          const i = +b.getAttribute("data-del");
+          state.queries.splice(i, 1);
+          renderRows();
+        });
+      });
+      if (sortable) sortable.destroy();
+      sortable = new Sortable(wrap, {
+        handle: ".handle",
+        animation: 150,
+        onEnd() {
+          const inputs = [...wrap.querySelectorAll("input[type=text]")];
+          state.queries = inputs.map((inp) => inp.value);
+          renderRows();
+        },
+      });
+    }
+
+    function escapeAttr(s) {
+      return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    }
+
+    function renderQr(url) {
+      const el = document.getElementById("qr");
+      el.innerHTML = "";
+      if (typeof QRCode !== "undefined") new QRCode(el, { text: url, width: 200, height: 200 });
+    }
+
+    function renderAll() {
+      document.getElementById("template").value = state.serviceTemplate || "";
+      document.getElementById("statusLine").textContent =
+        "カウンタ: " + state.counter +
+        " / パフォーマンス: " + (state.performanceActive ? "ON" : "OFF") +
+        (state.permanent ? "（永続モード）" : "");
+      const ul = document.getElementById("preview");
+      ul.innerHTML = "";
+      (state.queries || []).forEach((q, k) => {
+        const li = document.createElement("li");
+        li.textContent = (k + 1) + ". " + (q || "（空）");
+        ul.appendChild(li);
+      });
+      renderRows();
+      const full = audienceOrigin() + publicPath;
+      document.getElementById("publicUrl").textContent = full;
+      renderQr(full);
+      document.getElementById("perf").style.display = state.performanceActive ? "flex" : "none";
+      document.getElementById("perfText").textContent = state.permanent
+        ? "永続化モード: 終了後もカウンタは維持されます。"
+        : "通常モード: 終了するとカウンタは0に戻ります。";
+    }
+
+    async function load() {
+      const data = await api("/api/state");
+      publicPath = data.publicPath || "";
+      publicBaseUrl = typeof data.publicBaseUrl === "string" ? data.publicBaseUrl.trim() : "";
+      state = data.state;
+      renderAll();
+    }
+
+    async function save() {
+      state.serviceTemplate = document.getElementById("template").value.trim();
+      if (!state.serviceTemplate.includes("{query}")) {
+        toast("{query} を含めてください");
+        return;
+      }
+      const data = await api("/api/state", { method: "PUT", body: JSON.stringify({ queries: state.queries, serviceTemplate: state.serviceTemplate }) });
+      state = data.state;
+      toast("保存しました");
+      renderAll();
+    }
+
+    function openCard(row) {
+      cardRow = row;
+      pick = { m: "", n: "", o: "" };
+      document.getElementById("cardModal").style.display = "flex";
+      syncCardInfo();
+      const nums = document.getElementById("nums");
+      nums.innerHTML = "";
+      for (let i = 1; i <= 13; i++) {
+        const d = document.createElement("div");
+        d.textContent = String(i);
+        d.addEventListener("click", () => { pick.n = String(i); tryCommitCard(); syncCardInfo(); });
+        nums.appendChild(d);
+      }
+      const jo = document.createElement("div");
+      jo.textContent = "Jo";
+      jo.style.gridColumn = "span 2";
+      jo.addEventListener("click", () => { pick.n = "Jo"; pick.m = ""; tryCommitCard(); syncCardInfo(); });
+      nums.appendChild(jo);
+      const orders = document.getElementById("orders");
+      orders.innerHTML = "";
+      for (let i = 1; i <= 10; i++) {
+        const d = document.createElement("div");
+        d.textContent = String(i);
+        d.addEventListener("click", () => { pick.o = String(i); tryCommitCard(); syncCardInfo(); });
+        orders.appendChild(d);
+      }
+      document.querySelectorAll("#marks div").forEach((d) => {
+        d.onclick = () => { pick.m = d.getAttribute("data-m"); tryCommitCard(); syncCardInfo(); };
+      });
+    }
+
+    function syncCardInfo() {
+      document.getElementById("cardInfo").textContent = " M:" + (pick.m || "-") + " Num:" + (pick.n || "-") + " Ord:" + (pick.o || "-");
+    }
+
+    function tryCommitCard() {
+      if (pick.n === "Jo" && pick.o) {
+        state.queries[cardRow] = "Jo/" + pick.o;
+        closeCard();
+        renderRows();
+        return;
+      }
+      if (pick.m && pick.n && pick.n !== "Jo" && pick.o) {
+        state.queries[cardRow] = pick.m + pick.n + "/" + pick.o;
+        closeCard();
+        renderRows();
+      }
+    }
+
+    function closeCard() {
+      document.getElementById("cardModal").style.display = "none";
+      cardRow = -1;
+    }
+
+    document.getElementById("cardClose").onclick = closeCard;
+    document.getElementById("cardClear").onclick = () => {
+      if (cardRow >= 0) state.queries[cardRow] = "";
+      closeCard();
+      renderRows();
+    };
+
+    document.getElementById("gateBtn").onclick = () => {
+      const v = document.getElementById("gateToken").value.trim();
+      if (!v) return toast("トークンを入力してください");
+      adminToken = v;
+      localStorage.setItem(LS, adminToken);
+      startApp();
+    };
+
+    document.getElementById("addRow").onclick = () => {
+      state.queries.push("");
+      renderRows();
+    };
+    document.getElementById("saveBtn").onclick = () => save().catch((e) => toast(String(e.message || e)));
+    document.getElementById("resetCounter").onclick = () =>
+      api("/api/reset-counter", { method: "POST" })
+        .then((d) => { state = d.state; toast("カウンタを0にしました"); renderAll(); })
+        .catch((e) => toast(String(e.message || e)));
+
+    document.getElementById("btnPerform").onclick = () =>
+      api("/api/performance", { method: "POST", body: JSON.stringify({ action: "start", permanent: false }) })
+        .then((d) => { state = d.state; toast("パフォーマンス開始"); renderAll(); })
+        .catch((e) => toast(String(e.message || e)));
+
+    document.getElementById("btnPermanent").onclick = () =>
+      api("/api/performance", { method: "POST", body: JSON.stringify({ action: "start", permanent: true }) })
+        .then((d) => { state = d.state; toast("永続化パフォーマンス開始"); renderAll(); })
+        .catch((e) => toast(String(e.message || e)));
+
+    document.getElementById("btnFinish").onclick = () =>
+      api("/api/performance", { method: "POST", body: JSON.stringify({ action: "end" }) })
+        .then((d) => { state = d.state; toast("終了しました"); renderAll(); })
+        .catch((e) => toast(String(e.message || e)));
+
+    let pollTimer = null;
+    function startPublicUrlPoller() {
+      if (pollTimer) return;
+      let n = 0;
+      pollTimer = setInterval(async () => {
+        n++;
+        if (n > 45) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+        try {
+          const r = await fetch("/api/public-qr-hint");
+          const d = await r.json();
+          const base = (d.publicBaseUrl || "").replace(/\/+$/, "");
+          if (base && d.publicPath && state) {
+            const changed = base !== publicBaseUrl;
+            publicBaseUrl = base;
+            publicPath = d.publicPath;
+            if (changed) {
+              const full = audienceOrigin() + publicPath;
+              document.getElementById("publicUrl").textContent = full;
+              renderQr(full);
+            }
+          }
+        } catch (_) {}
+      }, 2000);
+    }
+
+    async function startApp() {
+      try {
+        await load();
+        gate.style.display = "none";
+        appEl.style.display = "block";
+        startPublicUrlPoller();
+      } catch (e) {
+        localStorage.removeItem(LS);
+        adminToken = "";
+        gate.style.display = "block";
+        appEl.style.display = "none";
+        toast("読み込み失敗: トークンを確認してください");
+      }
+    }
+
+    if (adminToken) startApp();
+  </script>
+</body>
+</html>
