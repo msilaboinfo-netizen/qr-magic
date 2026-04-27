@@ -199,7 +199,11 @@ app.get("/r/:token", (req, res) => {
   const state = readState();
   const tickets = state.tickets && typeof state.tickets === "object" ? state.tickets : {};
 
-  /** 名刺用: frozen=初回でキーワード固定 / recycle=常にいまのキーワードでリダイレクト */
+  /**
+   * 名刺用:
+   * - 一度でも query が入った URL（永久化で初回表示されたもの）は、モード変更後も常にその単語のまま
+   * - query がまだ無い URL だけ: recycle なら毎回いまのキーワード / frozen なら初回で query を保存して固定
+   */
   if (tickets[token]) {
     const t = tickets[token];
     const recycle = state.ticketKeywordMode === "recycle";
@@ -207,6 +211,11 @@ app.get("/r/:token", (req, res) => {
       t.template && String(t.template).includes("{query}")
         ? String(t.template)
         : state.serviceTemplate || defaultState().serviceTemplate;
+
+    if (ticketQueryBound(t)) {
+      const url = buildUrl(tmpl, String(t.query || "").trim(), req);
+      return res.redirect(302, url);
+    }
 
     if (recycle) {
       const live = firstNonEmptyQuery(state);
@@ -218,30 +227,28 @@ app.get("/r/:token", (req, res) => {
 <body style="font-family:sans-serif;padding:1.5rem;line-height:1.6;max-width:28rem">
 <p style="font-size:1.1rem;font-weight:bold">キーワードが空です</p>
 <p>管理画面でキーワードを入力し <strong>「設定を保存」</strong> してから、もう一度このQRを読み取ってください。</p>
-<p style="color:#555;font-size:.9rem">リサイクルモードでは、保存されている単語がその都度使われます。</p>
+<p style="color:#555;font-size:.9rem">リサイクルでは、まだ永久化で固定されていない名刺URLだけが、保存中のキーワードに追従します。</p>
 </body></html>`);
       }
       const url = buildUrl(tmpl, live, req);
       return res.redirect(302, url);
     }
 
-    if (!ticketQueryBound(t)) {
-      const live = firstNonEmptyQuery(state);
-      if (!live) {
-        return res.status(503).type("html").send(`<!DOCTYPE html>
+    const live = firstNonEmptyQuery(state);
+    if (!live) {
+      return res.status(503).type("html").send(`<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>名刺QR</title></head>
 <body style="font-family:sans-serif;padding:1.5rem;line-height:1.6;max-width:28rem">
 <p style="font-size:1.1rem;font-weight:bold">まだ単語が入っていません</p>
 <p>マジシャン側の管理画面で、キーワードを入力して <strong>「設定を保存」</strong> してから、もう一度このQRを読み取ってください。</p>
-<p style="color:#555;font-size:.9rem">永久化モードでは、初めて読まれたときの単語に固定されます。</p>
+<p style="color:#555;font-size:.9rem">永久化では、この初回で単語がこの名刺URLに固定され、あとから変わりません。</p>
 </body></html>`);
-      }
-      t.query = live;
-      writeState(state);
     }
-    const url = buildUrl(tmpl, String(t.query || "").trim(), req);
+    t.query = live;
+    writeState(state);
+    const url = buildUrl(tmpl, live, req);
     return res.redirect(302, url);
   }
 

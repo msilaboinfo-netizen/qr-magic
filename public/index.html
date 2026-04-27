@@ -65,8 +65,8 @@
 
     <div class="panel">
       <h2>名刺用キーワードのモード</h2>
-      <p class="muted"><strong>永久化</strong>…その名刺URLは、<strong>初めて読まれたとき</strong>のキーワードに固定されます。あとからキーワードを変えても<strong>その名刺の結果は変わりません</strong>。</p>
-      <p class="muted"><strong>リサイクル</strong>…キーワードを変えて保存するたび、<strong>同じ名刺URLでも</strong>いつも<strong>いまのキーワード</strong>の検索に飛びます（何度読んでも最新の単語に追従）。</p>
+      <p class="muted"><strong>永久化</strong>…その名刺URLが<strong>初めて</strong>読まれたときのキーワードがサーバーに保存され、<strong>モードを変えてもキーワードを変えても、もうそのURLの単語は変わりません</strong>。</p>
+      <p class="muted"><strong>リサイクル</strong>…<strong>まだ永久化で一度も読まれていない</strong>名刺URLだけ、保存したキーワードの変更に<strong>毎回追従</strong>します。一度永久化で表示・固定されたURLは追従しません。</p>
       <div class="toolbar">
         <button type="button" class="btn-secondary" id="btnModeFrozen">永久化</button>
         <button type="button" class="btn-secondary" id="btnModeRecycle">リサイクル</button>
@@ -82,7 +82,7 @@
     <div class="panel">
       <h2>名刺用QR（1枚＝1URL）</h2>
       <p class="muted">先に<strong>URLだけ</strong>をたくさん作り、名刺に<strong>それぞれ違うQR</strong>を印刷しておきます。</p>
-      <p class="muted"><strong>永久化</strong>のときは、名刺ごとに「いつ読ませるか」でキーワードを変えて初回をずらすと別の単語にできます。<strong>リサイクル</strong>のときは全名刺が同じキーワードの動きに追従します。</p>
+      <p class="muted"><strong>永久化</strong>で初回をずらすと名刺ごとに別の単語にできます。<strong>リサイクル</strong>は、まだ固定されていない名刺だけがキーワード変更に追従します。</p>
       <p class="muted">飛び先はプルダウンで選んだテンプレートを使います。1回あたり最大5000枚。</p>
       <p id="ticketStatus" class="muted"></p>
       <label class="muted">枚数</label>
@@ -164,8 +164,8 @@
       document.getElementById("btnModeRecycle").className = m === "recycle" ? "btn-primary" : "btn-secondary";
       document.getElementById("modeLine").textContent =
         m === "frozen"
-          ? "いまのモード: 永久化（初回スキャンでキーワード固定）"
-          : "いまのモード: リサイクル（保存したキーワードに常に追従）";
+          ? "いまのモード: 永久化（初回でそのURLの単語が永久に固定）"
+          : "いまのモード: リサイクル（未固定の名刺URLだけ、キーワード変更に追従）";
     }
 
     function collectPresetsFromDom() {
