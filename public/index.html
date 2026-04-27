@@ -90,9 +90,10 @@
     <p class="info">通常: 終了後カウンタ0に。永続化: 終了後もカウンタ維持（使い回しはしにくくなります）。</p>
 
     <div class="panel">
-      <h2>名刺用QR（1枚＝1URL・結果固定）</h2>
-      <p class="muted">上のキーワードを<strong>順番どおり</strong>に割り当てて、別URLをたくさん作ります。<strong>パフォーマンスは不要</strong>で、いつ読んでも同じキーワードの検索に飛びます（他のお客向けのショーと混ざりません）。</p>
-      <p class="muted">飛び先は「リダイレクトURLのテンプレート」の設定を使います（あとからテンプレを変えれば、同じキーワードでも行き先だけ変えられます）。1回あたり最大5000枚。</p>
+      <h2>名刺用QR（1枚＝1URL・初回で単語固定）</h2>
+      <p class="muted">先に<strong>URLだけ</strong>をたくさん作り、名刺に<strong>それぞれ違うQR</strong>を印刷しておきます。<strong>パフォーマンスは不要</strong>です。</p>
+      <p class="muted">本番でマジシャンがスマホに<strong>そのときの単語</strong>（例：りんご）を入れて保存したうえで、観客がその名刺のQRを<strong>初めて</strong>読むと、その単語に<strong>ずっと</strong>固定されます（家に帰ってから読んでも同じ検索結果）。名刺ごとに別の単語にしたいときは、読ませるタイミングでキーワードを変えてください。</p>
+      <p class="muted">飛び先は「リダイレクトURLのテンプレート」を使います（あとからテンプレだけ変えれば、固定された単語の行き先を変えられます）。1回あたり最大5000枚。</p>
       <p id="ticketStatus" class="muted"></p>
       <label class="muted">枚数</label>
       <input type="number" id="ticketCount" value="10" min="1" max="5000" style="width:6rem;margin-left:.35rem" />

@@ -61,6 +61,7 @@ function defaultState() {
     serviceTemplate: "https://www.google.com/search?q={query}",
     /**
      * 名刺用: トークン → { query, template }
+     * query が null/空のときは「未割当」→ 初回GETでその時点のキーワード（queries の先頭の非空）を保存して固定
      * template が null のときは常に state.serviceTemplate を使う（将来の変更に追従）
      */
     tickets: {},
@@ -104,6 +105,21 @@ function buildUrl(template, query, req) {
     .replaceAll("{query}", encodeURIComponent(query));
 }
 
+/** 名刺の「いまの単語」: キーワード欄の上から最初の非空（マジシャンがスマホで入れた1語想定） */
+function firstNonEmptyQuery(state) {
+  const queries = Array.isArray(state.queries) ? state.queries : [];
+  for (const q of queries) {
+    const s = String(q || "").trim();
+    if (s.length > 0) return s;
+  }
+  return null;
+}
+
+function ticketQueryBound(t) {
+  if (!t || t.query == null) return false;
+  return String(t.query).trim().length > 0;
+}
+
 const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "512kb" }));
@@ -123,14 +139,30 @@ app.get("/r/:token", (req, res) => {
   const state = readState();
   const tickets = state.tickets && typeof state.tickets === "object" ? state.tickets : {};
 
-  /** 名刺用: キーワード固定・URLごと独立（パフォーマンス不要） */
+  /** 名刺用: 初回スキャンで「そのとき管理画面のキーワード」を保存し、以後ずっと同じ検索へ */
   if (tickets[token]) {
     const t = tickets[token];
+    if (!ticketQueryBound(t)) {
+      const live = firstNonEmptyQuery(state);
+      if (!live) {
+        return res.status(503).type("html").send(`<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>名刺QR</title></head>
+<body style="font-family:sans-serif;padding:1.5rem;line-height:1.6;max-width:28rem">
+<p style="font-size:1.1rem;font-weight:bold">まだ単語が入っていません</p>
+<p>マジシャン側の管理画面で、キーワードを入力して <strong>「設定を保存」</strong> してから、もう一度このQRを読み取ってください。</p>
+<p style="color:#555;font-size:.9rem">この名刺用URLは、初めて読まれたときの単語に固定されます。</p>
+</body></html>`);
+      }
+      t.query = live;
+      writeState(state);
+    }
     const tmpl =
       t.template && String(t.template).includes("{query}")
         ? String(t.template)
         : state.serviceTemplate || defaultState().serviceTemplate;
-    const url = buildUrl(tmpl, String(t.query || ""), req);
+    const url = buildUrl(tmpl, String(t.query || "").trim(), req);
     return res.redirect(302, url);
   }
 
@@ -232,7 +264,7 @@ app.post("/api/reset-counter", adminAuth, (req, res) => {
   res.json({ ok: true, state: { ...cur, ticketCount: Object.keys(cur.tickets || {}).length } });
 });
 
-/** 名刺用URLを count 枚ぶん発行（キーワードは現在のリストを順に割当） */
+/** 名刺用URLを count 枚ぶん発行（単語は未割当→初回スキャン時にそのときのキーワードで固定） */
 app.post("/api/tickets/bulk", adminAuth, (req, res) => {
   const raw = parseInt(req.body && req.body.count, 10);
   const count = Math.min(5000, Math.max(1, Number.isFinite(raw) ? raw : 0));
@@ -240,14 +272,9 @@ app.post("/api/tickets/bulk", adminAuth, (req, res) => {
     return res.status(400).json({ ok: false, message: "count は 1〜5000" });
   }
   const cur = readState();
-  const queries = (cur.queries || []).map((q) => String(q || "").trim()).filter((q) => q.length > 0);
-  if (queries.length === 0) {
-    return res.status(400).json({ ok: false, message: "キーワードを1つ以上入れて保存してください" });
-  }
   if (!cur.tickets || typeof cur.tickets !== "object") cur.tickets = {};
   const created = [];
   for (let i = 0; i < count; i++) {
-    const query = queries[i % queries.length];
     let tok;
     let guard = 0;
     do {
@@ -257,8 +284,8 @@ app.post("/api/tickets/bulk", adminAuth, (req, res) => {
     if (guard >= 50) {
       return res.status(500).json({ ok: false, message: "トークン生成に失敗しました" });
     }
-    cur.tickets[tok] = { query, template: null };
-    created.push({ token: tok, query, path: `/r/${tok}` });
+    cur.tickets[tok] = { query: null, template: null };
+    created.push({ token: tok, path: `/r/${tok}` });
   }
   writeState(cur);
   res.json({ ok: true, tickets: created, ticketCount: Object.keys(cur.tickets).length });
