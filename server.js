@@ -430,6 +430,16 @@ app.put("/api/state", adminAuth, (req, res) => {
   });
 });
 
+/** 登録中の名刺用パス一覧（管理画面の設定メニュー用） */
+app.get("/api/tickets", adminAuth, (req, res) => {
+  const state = readState();
+  const tickets =
+    state.tickets && typeof state.tickets === "object" && !Array.isArray(state.tickets) ? state.tickets : {};
+  const keys = Object.keys(tickets).sort();
+  const paths = keys.map((tok) => `/r/${tok}`);
+  res.json({ ok: true, ticketCount: paths.length, paths });
+});
+
 /** 名刺用URLを count 枚ぶん発行（単語は未割当。frozen なら初回で固定、recycle なら常に現在キーワード） */
 app.post("/api/tickets/bulk", adminAuth, (req, res) => {
   const raw = parseInt(req.body && req.body.count, 10);
