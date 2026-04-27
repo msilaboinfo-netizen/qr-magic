@@ -1,6 +1,6 @@
 /**
- * Personal QR show: ordered queries → each scan redirects (e.g. Google) and advances counter.
- * No user accounts: ADMIN_TOKEN protects / and /api/* ; PUBLIC_TOKEN is the /r/:slug path.
+ * Personal QR: name-card URLs bind on first scan; admin is ADMIN_TOKEN.
+ * Legacy /r/PUBLIC_TOKEN is retired (404). Tickets use /r/:randomToken.
  */
 require("dotenv").config();
 
@@ -53,7 +53,8 @@ function ensureDataDir() {
 
 function defaultState() {
   return {
-    queries: ["", "", ""],
+    queries: [""],
+    /** legacy fields ignored by current app; kept in JSON for older state files */
     counter: 0,
     performanceActive: false,
     permanent: false,
@@ -68,6 +69,16 @@ function defaultState() {
   };
 }
 
+/** キーワードは1語だけ。旧データの複数行は先頭の非空1つに畳む */
+function normalizeQueriesToSingle(queries) {
+  const arr = Array.isArray(queries) ? queries : [""];
+  for (const q of arr) {
+    const s = String(q || "").trim();
+    if (s.length > 0) return [s];
+  }
+  return [""];
+}
+
 function readState() {
   ensureDataDir();
   if (!fs.existsSync(STATE_FILE)) {
@@ -78,7 +89,9 @@ function readState() {
   try {
     const raw = fs.readFileSync(STATE_FILE, "utf8");
     const parsed = JSON.parse(raw);
-    return { ...defaultState(), ...parsed };
+    const merged = { ...defaultState(), ...parsed };
+    merged.queries = normalizeQueriesToSingle(merged.queries);
+    return merged;
   } catch {
     return defaultState();
   }
@@ -124,13 +137,10 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "512kb" }));
 
-/** 管理画面のQR用。トークンはQRに載る想定のため公開してよい情報のみ */
+/** トンネル等で観客用オリジンが決まったら管理画面がポーリングする（URL表示は廃止済み） */
 app.get("/api/public-qr-hint", (req, res) => {
   const base = getPublicBaseUrl();
-  res.json({
-    publicBaseUrl: base || null,
-    publicPath: `/r/${PUBLIC_TOKEN}`,
-  });
+  res.json({ ok: true, publicBaseUrl: base || null });
 });
 
 /** Spectator scan */
@@ -166,36 +176,18 @@ app.get("/r/:token", (req, res) => {
     return res.redirect(302, url);
   }
 
-  if (token !== PUBLIC_TOKEN) {
-    return res.status(404).send("Not found");
-  }
-  if (!state.performanceActive) {
-    return res.status(200).type("html").send(`<!DOCTYPE html>
+  if (token === PUBLIC_TOKEN) {
+    return res.status(404).type("html").send(`<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Show</title></head>
+<title>QR</title></head>
 <body style="font-family:sans-serif;padding:1.5rem;line-height:1.6;max-width:28rem">
-<p style="font-size:1.25rem;font-weight:bold">準備中です</p>
-<p>このURLは、管理画面（トップ）で <strong>「パフォーマンス」</strong> を押してから有効になります。</p>
-<p style="color:#555;font-size:.9rem">キーワードを入れたあと <strong>「設定を保存」</strong> も忘れずに。</p>
+<p style="font-size:1.1rem;font-weight:bold">この共通URLは使われていません</p>
+<p>名刺用に発行した<strong>それぞれ違うURL</strong>のQRを読み取ってください。</p>
 </body></html>`);
   }
 
-  const queries = Array.isArray(state.queries) ? state.queries : [];
-  const slots = queries
-    .map((q, i) => ({ i, q: String(q || "").trim() }))
-    .filter((x) => x.q.length > 0);
-  if (slots.length === 0) {
-    return res.status(503).type("html").send("<!DOCTYPE html><html lang=ja><meta charset=utf-8><body>キーワードが未設定です。</body></html>");
-  }
-
-  const pick = slots[state.counter % slots.length];
-  const query = pick.q;
-  const url = buildUrl(state.serviceTemplate || defaultState().serviceTemplate, query, req);
-
-  state.counter = (state.counter || 0) + 1;
-  writeState(state);
-  return res.redirect(302, url);
+  return res.status(404).send("Not found");
 });
 
 /** Admin API */
@@ -203,14 +195,9 @@ app.get("/api/state", adminAuth, (req, res) => {
   const state = readState();
   res.json({
     ok: true,
-    publicPath: `/r/${PUBLIC_TOKEN}`,
-    publicToken: PUBLIC_TOKEN,
     publicBaseUrl: getPublicBaseUrl() || null,
     state: {
       queries: state.queries,
-      counter: state.counter,
-      performanceActive: state.performanceActive,
-      permanent: state.permanent,
       serviceTemplate: state.serviceTemplate,
       ticketCount: Object.keys(state.tickets || {}).length,
     },
@@ -226,7 +213,7 @@ app.put("/api/state", adminAuth, (req, res) => {
   }
   const next = {
     ...cur,
-    queries: Array.isArray(body.queries) ? body.queries.map((q) => String(q)) : cur.queries,
+    queries: normalizeQueriesToSingle(Array.isArray(body.queries) ? body.queries.map((q) => String(q)) : cur.queries),
     serviceTemplate,
   };
   writeState(next);
@@ -234,45 +221,6 @@ app.put("/api/state", adminAuth, (req, res) => {
     ok: true,
     state: { ...next, ticketCount: Object.keys(next.tickets || {}).length },
   });
-});
-
-/** 永続化フラグは JSON の厳密な true のみ（Boolean("false")===true 事故を避ける） */
-function bodyPermanentTrue(body) {
-  return body && body.permanent === true;
-}
-
-app.post("/api/performance", adminAuth, (req, res) => {
-  const cur = readState();
-  const action = req.body && req.body.action;
-  if (action === "start") {
-    const incomingPerm = bodyPermanentTrue(req.body);
-    const wasActive = !!cur.performanceActive;
-    cur.performanceActive = true;
-    cur.permanent = incomingPerm;
-    // 永続化公演のあと counter が残ると、通常開始でも「続きから」になり永続化したように見える → 通常は常に0から
-    if (!incomingPerm && !wasActive) {
-      cur.counter = 0;
-    }
-    writeState(cur);
-    return res.json({ ok: true, state: { ...cur, ticketCount: Object.keys(cur.tickets || {}).length } });
-  }
-  if (action === "end") {
-    cur.performanceActive = false;
-    if (!cur.permanent) {
-      cur.counter = 0;
-    }
-    cur.permanent = false;
-    writeState(cur);
-    return res.json({ ok: true, state: { ...cur, ticketCount: Object.keys(cur.tickets || {}).length } });
-  }
-  return res.status(400).json({ ok: false, message: "action must be start|end" });
-});
-
-app.post("/api/reset-counter", adminAuth, (req, res) => {
-  const cur = readState();
-  cur.counter = 0;
-  writeState(cur);
-  res.json({ ok: true, state: { ...cur, ticketCount: Object.keys(cur.tickets || {}).length } });
 });
 
 /** 名刺用URLを count 枚ぶん発行（単語は未割当→初回スキャン時にそのときのキーワードで固定） */
