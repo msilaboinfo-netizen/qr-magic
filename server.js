@@ -65,6 +65,8 @@ function defaultState() {
      * query が null/空のときは「未割当」→ 初回GETでその時点のキーワード（queries の先頭の非空）を保存して固定
      * template が null のときは常に state.serviceTemplate を使う（将来の変更に追従）
      */
+    /** 名刺用キーワード: frozen=初回で固定 / recycle=常に管理画面のキーワードに追従 */
+    ticketKeywordMode: "frozen",
     tickets: {},
   };
 }
@@ -102,6 +104,10 @@ function migrateTemplatePresets(merged) {
   syncTemplatesFromPresets(merged);
 }
 
+function normalizeTicketKeywordMode(s) {
+  s.ticketKeywordMode = s.ticketKeywordMode === "recycle" ? "recycle" : "frozen";
+}
+
 /** キーワードは1語だけ。旧データの複数行は先頭の非空1つに畳む */
 function normalizeQueriesToSingle(queries) {
   const arr = Array.isArray(queries) ? queries : [""];
@@ -125,6 +131,7 @@ function readState() {
     const merged = { ...defaultState(), ...parsed };
     merged.queries = normalizeQueriesToSingle(merged.queries);
     migrateTemplatePresets(merged);
+    normalizeTicketKeywordMode(merged);
     return merged;
   } catch {
     return defaultState();
@@ -192,9 +199,32 @@ app.get("/r/:token", (req, res) => {
   const state = readState();
   const tickets = state.tickets && typeof state.tickets === "object" ? state.tickets : {};
 
-  /** 名刺用: 初回スキャンで「そのとき管理画面のキーワード」を保存し、以後ずっと同じ検索へ */
+  /** 名刺用: frozen=初回でキーワード固定 / recycle=常にいまのキーワードでリダイレクト */
   if (tickets[token]) {
     const t = tickets[token];
+    const recycle = state.ticketKeywordMode === "recycle";
+    const tmpl =
+      t.template && String(t.template).includes("{query}")
+        ? String(t.template)
+        : state.serviceTemplate || defaultState().serviceTemplate;
+
+    if (recycle) {
+      const live = firstNonEmptyQuery(state);
+      if (!live) {
+        return res.status(503).type("html").send(`<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>名刺QR</title></head>
+<body style="font-family:sans-serif;padding:1.5rem;line-height:1.6;max-width:28rem">
+<p style="font-size:1.1rem;font-weight:bold">キーワードが空です</p>
+<p>管理画面でキーワードを入力し <strong>「設定を保存」</strong> してから、もう一度このQRを読み取ってください。</p>
+<p style="color:#555;font-size:.9rem">リサイクルモードでは、保存されている単語がその都度使われます。</p>
+</body></html>`);
+      }
+      const url = buildUrl(tmpl, live, req);
+      return res.redirect(302, url);
+    }
+
     if (!ticketQueryBound(t)) {
       const live = firstNonEmptyQuery(state);
       if (!live) {
@@ -205,16 +235,12 @@ app.get("/r/:token", (req, res) => {
 <body style="font-family:sans-serif;padding:1.5rem;line-height:1.6;max-width:28rem">
 <p style="font-size:1.1rem;font-weight:bold">まだ単語が入っていません</p>
 <p>マジシャン側の管理画面で、キーワードを入力して <strong>「設定を保存」</strong> してから、もう一度このQRを読み取ってください。</p>
-<p style="color:#555;font-size:.9rem">この名刺用URLは、初めて読まれたときの単語に固定されます。</p>
+<p style="color:#555;font-size:.9rem">永久化モードでは、初めて読まれたときの単語に固定されます。</p>
 </body></html>`);
       }
       t.query = live;
       writeState(state);
     }
-    const tmpl =
-      t.template && String(t.template).includes("{query}")
-        ? String(t.template)
-        : state.serviceTemplate || defaultState().serviceTemplate;
     const url = buildUrl(tmpl, String(t.query || "").trim(), req);
     return res.redirect(302, url);
   }
@@ -244,6 +270,7 @@ app.get("/api/state", adminAuth, (req, res) => {
       serviceTemplate: state.serviceTemplate,
       templatePresets: state.templatePresets,
       activeTemplateIndex: state.activeTemplateIndex,
+      ticketKeywordMode: state.ticketKeywordMode,
       ticketCount: Object.keys(state.tickets || {}).length,
     },
   });
@@ -291,6 +318,13 @@ app.put("/api/state", adminAuth, (req, res) => {
     syncTemplatesFromPresets(next);
   }
 
+  if (body.ticketKeywordMode === "recycle" || body.ticketKeywordMode === "frozen") {
+    next.ticketKeywordMode = body.ticketKeywordMode;
+  } else {
+    next.ticketKeywordMode = cur.ticketKeywordMode === "recycle" ? "recycle" : "frozen";
+  }
+  normalizeTicketKeywordMode(next);
+
   writeState(next);
   res.json({
     ok: true,
@@ -298,7 +332,7 @@ app.put("/api/state", adminAuth, (req, res) => {
   });
 });
 
-/** 名刺用URLを count 枚ぶん発行（単語は未割当→初回スキャン時にそのときのキーワードで固定） */
+/** 名刺用URLを count 枚ぶん発行（単語は未割当。frozen なら初回で固定、recycle なら常に現在キーワード） */
 app.post("/api/tickets/bulk", adminAuth, (req, res) => {
   const raw = parseInt(req.body && req.body.count, 10);
   const count = Math.min(5000, Math.max(1, Number.isFinite(raw) ? raw : 0));

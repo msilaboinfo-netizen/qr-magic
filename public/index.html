@@ -55,7 +55,7 @@
 
     <div class="panel">
       <h2>キーワード</h2>
-      <p class="muted">名刺用QRの<strong>初回</strong>に使う単語です。本番で入れ替えてから <strong>設定を保存</strong>し、観客に読ませてください。</p>
+      <p class="muted">名刺用QRで使う単語です。<strong>設定を保存</strong>した内容が参照されます（モードにより「初回だけ固定」か「その都度追従」かが変わります）。</p>
       <input type="text" id="keyword" placeholder="例: りんご" autocomplete="off" />
       <div class="toolbar">
         <button type="button" class="btn-secondary" id="btnPreviewKeyword">プレビュー</button>
@@ -64,15 +64,26 @@
     </div>
 
     <div class="panel">
+      <h2>名刺用キーワードのモード</h2>
+      <p class="muted"><strong>永久化</strong>…その名刺URLは、<strong>初めて読まれたとき</strong>のキーワードに固定されます。あとからキーワードを変えても<strong>その名刺の結果は変わりません</strong>。</p>
+      <p class="muted"><strong>リサイクル</strong>…キーワードを変えて保存するたび、<strong>同じ名刺URLでも</strong>いつも<strong>いまのキーワード</strong>の検索に飛びます（何度読んでも最新の単語に追従）。</p>
+      <div class="toolbar">
+        <button type="button" class="btn-secondary" id="btnModeFrozen">永久化</button>
+        <button type="button" class="btn-secondary" id="btnModeRecycle">リサイクル</button>
+      </div>
+      <p id="modeLine" class="muted" style="margin-top:0.5rem"></p>
+    </div>
+
+    <div class="panel">
       <h2>現在の状態</h2>
       <p id="statusLine" class="muted"></p>
     </div>
 
     <div class="panel">
-      <h2>名刺用QR（1枚＝1URL・初回で単語固定）</h2>
+      <h2>名刺用QR（1枚＝1URL）</h2>
       <p class="muted">先に<strong>URLだけ</strong>をたくさん作り、名刺に<strong>それぞれ違うQR</strong>を印刷しておきます。</p>
-      <p class="muted">本番で上のキーワードを入れて保存したうえで、観客がその名刺のQRを<strong>初めて</strong>読むと、その単語に<strong>ずっと</strong>固定されます。名刺ごとに別の単語にしたいときは、読ませるタイミングでキーワードを変えてください。</p>
-      <p class="muted">飛び先はプルダウンで選んだテンプレートを使います（あとから差し替え可能）。1回あたり最大5000枚。</p>
+      <p class="muted"><strong>永久化</strong>のときは、名刺ごとに「いつ読ませるか」でキーワードを変えて初回をずらすと別の単語にできます。<strong>リサイクル</strong>のときは全名刺が同じキーワードの動きに追従します。</p>
+      <p class="muted">飛び先はプルダウンで選んだテンプレートを使います。1回あたり最大5000枚。</p>
       <p id="ticketStatus" class="muted"></p>
       <label class="muted">枚数</label>
       <input type="number" id="ticketCount" value="10" min="1" max="5000" style="width:6rem;margin-left:.35rem" />
@@ -141,6 +152,20 @@
         state.templatePresets = [{ label: "Google", template: t }];
         state.activeTemplateIndex = 0;
       }
+    }
+
+    function ticketKeywordMode() {
+      return state && state.ticketKeywordMode === "recycle" ? "recycle" : "frozen";
+    }
+
+    function renderTicketModeUi() {
+      const m = ticketKeywordMode();
+      document.getElementById("btnModeFrozen").className = m === "frozen" ? "btn-primary" : "btn-secondary";
+      document.getElementById("btnModeRecycle").className = m === "recycle" ? "btn-primary" : "btn-secondary";
+      document.getElementById("modeLine").textContent =
+        m === "frozen"
+          ? "いまのモード: 永久化（初回スキャンでキーワード固定）"
+          : "いまのモード: リサイクル（保存したキーワードに常に追従）";
     }
 
     function collectPresetsFromDom() {
@@ -214,12 +239,15 @@
         ((state.queries && state.queries[0]) || "（空）") +
         " / テンプレ: " +
         curLabel +
+        " / モード: " +
+        (ticketKeywordMode() === "recycle" ? "リサイクル" : "永久化") +
         " / 名刺用URL数: " +
         (state.ticketCount != null ? state.ticketCount : 0);
       document.getElementById("ticketStatus").textContent =
         "登録中の名刺用URL: " + (state.ticketCount != null ? state.ticketCount : 0) + " 本";
       renderTemplateBlock();
       syncKeywordFromState();
+      renderTicketModeUi();
     }
 
     async function load() {
@@ -246,6 +274,7 @@
           extra && extra.activeTemplateIndex !== undefined
             ? extra.activeTemplateIndex
             : parseInt(document.getElementById("templateSelect").value, 10) || 0,
+        ticketKeywordMode: ticketKeywordMode(),
       };
       const data = await api("/api/state", { method: "PUT", body: JSON.stringify(body) });
       state = data.state;
@@ -274,7 +303,12 @@
         }
         const data = await api("/api/state", {
           method: "PUT",
-          body: JSON.stringify({ queries: [kw], templatePresets: presets, activeTemplateIndex: idx }),
+          body: JSON.stringify({
+            queries: [kw],
+            templatePresets: presets,
+            activeTemplateIndex: idx,
+            ticketKeywordMode: ticketKeywordMode(),
+          }),
         });
         state = data.state;
         toast("切り替えました");
@@ -305,6 +339,22 @@
 
     document.getElementById("saveBtn").onclick = () => save();
     document.getElementById("btnSavePresets").onclick = () => save();
+
+    async function setTicketKeywordMode(mode) {
+      try {
+        const data = await api("/api/state", {
+          method: "PUT",
+          body: JSON.stringify({ ticketKeywordMode: mode }),
+        });
+        state = data.state;
+        toast(mode === "frozen" ? "永久化にしました" : "リサイクルにしました");
+        renderAll();
+      } catch (e) {
+        toast(String(e.message || e));
+      }
+    }
+    document.getElementById("btnModeFrozen").onclick = () => setTicketKeywordMode("frozen");
+    document.getElementById("btnModeRecycle").onclick = () => setTicketKeywordMode("recycle");
 
     document.getElementById("btnAddPreset").onclick = () => {
       ensurePresets();
