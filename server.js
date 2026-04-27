@@ -236,12 +236,23 @@ app.put("/api/state", adminAuth, (req, res) => {
   });
 });
 
+/** 永続化フラグは JSON の厳密な true のみ（Boolean("false")===true 事故を避ける） */
+function bodyPermanentTrue(body) {
+  return body && body.permanent === true;
+}
+
 app.post("/api/performance", adminAuth, (req, res) => {
   const cur = readState();
   const action = req.body && req.body.action;
   if (action === "start") {
+    const incomingPerm = bodyPermanentTrue(req.body);
+    const wasActive = !!cur.performanceActive;
     cur.performanceActive = true;
-    cur.permanent = Boolean(req.body.permanent);
+    cur.permanent = incomingPerm;
+    // 永続化公演のあと counter が残ると、通常開始でも「続きから」になり永続化したように見える → 通常は常に0から
+    if (!incomingPerm && !wasActive) {
+      cur.counter = 0;
+    }
     writeState(cur);
     return res.json({ ok: true, state: { ...cur, ticketCount: Object.keys(cur.tickets || {}).length } });
   }
