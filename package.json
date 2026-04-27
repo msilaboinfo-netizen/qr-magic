@@ -1,6 +1,6 @@
 {
   "name": "qr-magic",
-  "version": "1.0.7",
+  "version": "1.0.9",
   "private": true,
   "description": "Personal QR redirect show (no login)",
   "main": "server.js",
@@ -9,7 +9,8 @@
     "dev": "node server.js",
     "public": "concurrently -k -n srv,tun -c blue,magenta \"node server.js\" \"node tunnel-only.js\"",
     "embed": "node scripts/embed.js",
-    "deploy": "node scripts/deploy-render.js"
+    "deploy": "node scripts/deploy-render.js",
+    "render:set-supabase": "node scripts/set-render-supabase-env.js"
   },
   "engines": {
     "node": ">=18"

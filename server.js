@@ -26,6 +26,27 @@ const path = require("path");
 const crypto = require("crypto");
 const express = require("express");
 
+/** Render 等のエフェメラルディスクでは消える。設定すると名刺URLもデプロイ後も残る */
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
+const SUPABASE_SERVICE_ROLE_KEY = (
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_SECRET_KEY ||
+  ""
+).trim();
+const QR_MAGIC_STATE_TABLE = "qr_magic_app_state";
+
+let supabaseClient = null;
+function getSupabase() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
+  if (!supabaseClient) {
+    const { createClient } = require("@supabase/supabase-js");
+    supabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+  }
+  return supabaseClient;
+}
+
 const PORT = Number(process.env.PORT || 3333);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "dev-admin-change-me";
 const PUBLIC_TOKEN = process.env.PUBLIC_TOKEN || "dev-public-change-me";
@@ -146,25 +167,51 @@ function normalizeQueriesToSingle(queries) {
   return [""];
 }
 
-function readState() {
+function hydrateMergedState(parsed) {
+  const merged = { ...defaultState(), ...(parsed && typeof parsed === "object" ? parsed : {}) };
+  merged.queries = normalizeQueriesToSingle(merged.queries);
+  normalizeTicketsOnRead(merged);
+  migrateTemplatePresets(merged);
+  normalizeTicketKeywordMode(merged);
+  return merged;
+}
+
+function readStateFromFileSync() {
   ensureDataDir();
   if (!fs.existsSync(STATE_FILE)) {
-    const s = defaultState();
-    writeState(s);
+    const s = hydrateMergedState({});
+    writeStateToFileSync(s);
     return s;
   }
   try {
     const raw = fs.readFileSync(STATE_FILE, "utf8");
     const parsed = JSON.parse(raw);
-    const merged = { ...defaultState(), ...parsed };
-    merged.queries = normalizeQueriesToSingle(merged.queries);
-    normalizeTicketsOnRead(merged);
-    migrateTemplatePresets(merged);
-    normalizeTicketKeywordMode(merged);
-    return merged;
+    return hydrateMergedState(parsed);
   } catch {
-    return defaultState();
+    return hydrateMergedState({});
   }
+}
+
+async function readStateFromSupabase() {
+  const sb = getSupabase();
+  const { data, error } = await sb.from(QR_MAGIC_STATE_TABLE).select("data").eq("id", 1).maybeSingle();
+  if (error) {
+    console.error("[qr-magic] Supabase readState:", error.message);
+    return hydrateMergedState({});
+  }
+  if (data && data.data != null && typeof data.data === "object") {
+    return hydrateMergedState(data.data);
+  }
+  if (fs.existsSync(STATE_FILE)) {
+    try {
+      const raw = fs.readFileSync(STATE_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      const merged = hydrateMergedState(parsed);
+      await writeStateToSupabase(merged);
+      return merged;
+    } catch (_) {}
+  }
+  return hydrateMergedState({});
 }
 
 /** 旧「パフォーマンス／永続化」用フィールド。もう使わないので保存時に落とす */
@@ -175,10 +222,38 @@ function stripLegacyPerformanceFlags(s) {
   delete s.permanent;
 }
 
-function writeState(state) {
+function writeStateToFileSync(state) {
   ensureDataDir();
   stripLegacyPerformanceFlags(state);
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+}
+
+async function writeStateToSupabase(state) {
+  const sb = getSupabase();
+  stripLegacyPerformanceFlags(state);
+  const row = {
+    id: 1,
+    data: state,
+    updated_at: new Date().toISOString(),
+  };
+  const { error } = await sb.from(QR_MAGIC_STATE_TABLE).upsert(row, { onConflict: "id" });
+  if (error) {
+    console.error("[qr-magic] Supabase writeState:", error.message);
+    throw error;
+  }
+}
+
+async function readState() {
+  if (getSupabase()) return readStateFromSupabase();
+  return readStateFromFileSync();
+}
+
+async function writeState(state) {
+  if (getSupabase()) {
+    await writeStateToSupabase(state);
+    return;
+  }
+  writeStateToFileSync(state);
 }
 
 function adminAuth(req, res, next) {
@@ -286,8 +361,14 @@ app.get("/api/public-qr-hint", (req, res) => {
 });
 
 /** Spectator scan */
-app.get("/r/:token", (req, res) => {
-  const state = readState();
+app.get("/r/:token", async (req, res) => {
+  let state;
+  try {
+    state = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).type("text/plain").send("Server error");
+  }
   const found = findTicketEntry(state, req.params.token);
   /**
    * 名刺用:
@@ -337,7 +418,12 @@ app.get("/r/:token", (req, res) => {
 </body></html>`);
     }
     state.tickets[ticketKey].query = live;
-    writeState(state);
+    try {
+      await writeState(state);
+    } catch (e) {
+      console.error(e);
+      return res.status(500).type("text/plain").send("Server error");
+    }
     const url = buildUrl(tmpl, live, req);
     return res.redirect(302, url);
   }
@@ -358,8 +444,14 @@ app.get("/r/:token", (req, res) => {
 });
 
 /** Admin API */
-app.get("/api/state", adminAuth, (req, res) => {
-  const state = readState();
+app.get("/api/state", adminAuth, async (req, res) => {
+  let state;
+  try {
+    state = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+  }
   res.json({
     ok: true,
     publicBaseUrl: getPublicBaseUrl() || null,
@@ -374,8 +466,14 @@ app.get("/api/state", adminAuth, (req, res) => {
   });
 });
 
-app.put("/api/state", adminAuth, (req, res) => {
-  const cur = readState();
+app.put("/api/state", adminAuth, async (req, res) => {
+  let cur;
+  try {
+    cur = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+  }
   const body = req.body || {};
   const next = {
     ...cur,
@@ -423,7 +521,12 @@ app.put("/api/state", adminAuth, (req, res) => {
   }
   normalizeTicketKeywordMode(next);
 
-  writeState(next);
+  try {
+    await writeState(next);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "保存に失敗しました（Supabase を確認）" });
+  }
   res.json({
     ok: true,
     state: { ...next, ticketCount: Object.keys(next.tickets || {}).length },
@@ -431,8 +534,14 @@ app.put("/api/state", adminAuth, (req, res) => {
 });
 
 /** 登録中の名刺用パス一覧（管理画面の設定メニュー用） */
-app.get("/api/tickets", adminAuth, (req, res) => {
-  const state = readState();
+app.get("/api/tickets", adminAuth, async (req, res) => {
+  let state;
+  try {
+    state = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+  }
   const tickets =
     state.tickets && typeof state.tickets === "object" && !Array.isArray(state.tickets) ? state.tickets : {};
   const keys = Object.keys(tickets).sort();
@@ -441,13 +550,19 @@ app.get("/api/tickets", adminAuth, (req, res) => {
 });
 
 /** 名刺用URLを count 枚ぶん発行（単語は未割当。frozen なら初回で固定、recycle なら常に現在キーワード） */
-app.post("/api/tickets/bulk", adminAuth, (req, res) => {
+app.post("/api/tickets/bulk", adminAuth, async (req, res) => {
   const raw = parseInt(req.body && req.body.count, 10);
   const count = Math.min(5000, Math.max(1, Number.isFinite(raw) ? raw : 0));
   if (!count) {
     return res.status(400).json({ ok: false, message: "count は 1〜5000" });
   }
-  const cur = readState();
+  let cur;
+  try {
+    cur = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+  }
   if (!cur.tickets || typeof cur.tickets !== "object") cur.tickets = {};
   const created = [];
   for (let i = 0; i < count; i++) {
@@ -463,18 +578,34 @@ app.post("/api/tickets/bulk", adminAuth, (req, res) => {
     cur.tickets[tok] = { query: null, template: null };
     created.push({ token: tok, path: `/r/${tok}` });
   }
-  writeState(cur);
+  try {
+    await writeState(cur);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "保存に失敗しました（Supabase を確認）" });
+  }
   res.json({ ok: true, tickets: created, ticketCount: Object.keys(cur.tickets).length });
 });
 
 /** 名刺用URLをすべて削除（確認用に body.confirm が true） */
-app.post("/api/tickets/clear", adminAuth, (req, res) => {
+app.post("/api/tickets/clear", adminAuth, async (req, res) => {
   if (!(req.body && req.body.confirm === true)) {
     return res.status(400).json({ ok: false, message: "body.confirm true が必要です" });
   }
-  const cur = readState();
+  let cur;
+  try {
+    cur = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+  }
   cur.tickets = {};
-  writeState(cur);
+  try {
+    await writeState(cur);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "保存に失敗しました（Supabase を確認）" });
+  }
   res.json({ ok: true, ticketCount: 0 });
 });
 
@@ -517,6 +648,12 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`QR magic listening on http://localhost:${PORT}`);
   console.log(`Admin: open http://localhost:${PORT}/  (Bearer ADMIN_TOKEN)`);
+  if (getSupabase()) {
+    console.log(`状態の保存先: Supabase テーブル ${QR_MAGIC_STATE_TABLE}（デプロイ後も維持）`);
+  } else {
+    console.log(`状態の保存先: ローカルファイル ${STATE_FILE}（Render 無料ディスクは非永続のため URL は消えます）`);
+    console.log(`永続化するには: .env.example の SUPABASE_* を参照`);
+  }
   const localPublic = `http://localhost:${PORT}/r/${PUBLIC_TOKEN}`;
   console.log(`Public QR path (local): ${localPublic}`);
   const pub = getPublicBaseUrl();

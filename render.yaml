@@ -16,3 +16,8 @@ services:
         sync: false
       - key: PUBLIC_TOKEN
         sync: false
+      # 名刺URLをデプロイ後も残す: Supabase で qr-magic-app-state.sql 実行後に設定
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
