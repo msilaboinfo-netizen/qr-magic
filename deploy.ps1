@@ -37,7 +37,8 @@ function Invoke-GitDeploy {
       exit 1
     }
   }
-  git push 2>&1 | Out-Host
+  # git writes "Everything up-to-date" to stderr; PowerShell would show it as a red error if we used 2>&1 here.
+  cmd /c "git push 2>&1"
   if ($LASTEXITCODE -ne 0) {
     $ErrorActionPreference = $oldEap
     Write-Error "git push failed"
