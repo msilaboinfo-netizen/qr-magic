@@ -22,6 +22,7 @@ function applyHostedPublicBaseUrl() {
 applyHostedPublicBaseUrl();
 
 const fs = require("fs");
+const https = require("https");
 const path = require("path");
 const crypto = require("crypto");
 const express = require("express");
@@ -52,6 +53,7 @@ function getSupabase() {
 const PORT = Number(process.env.PORT || 3333);
 const PUBLIC_TOKEN = process.env.PUBLIC_TOKEN || "dev-public-change-me";
 const ADMIN_ID = "19940131";
+const YOUTUBE_API_KEY = (process.env.YOUTUBE_API_KEY || "").trim();
 
 const DATA_DIR = path.join(__dirname, "data");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
@@ -90,12 +92,14 @@ const MAPS_SEARCH_TEMPLATE = "https://www.google.com/maps/search/?api=1&query={q
 function defaultState() {
   const google = "https://www.google.com/search?q={query}";
   const maps = MAPS_SEARCH_TEMPLATE;
+  const ytTop = "{host}/yt-top?q={query}";
   return {
     queries: [""],
     /** プルダウン用。実際のリダイレクトは activeTemplateIndex の template（serviceTemplate と同期） */
     templatePresets: [
       { label: "Google", template: google },
       { label: "Google マップ", template: maps },
+      { label: "YouTube 即再生(近似)", template: ytTop },
     ],
     activeTemplateIndex: 0,
     /** 互換・内部同期用（= templatePresets[activeTemplateIndex].template） */
@@ -160,6 +164,10 @@ function migrateTemplatePresets(merged) {
   const hasMaps = merged.templatePresets.some((p) => String(p.template || "").includes("google.com/maps"));
   if (!hasMaps && merged.templatePresets.length < MAX_TEMPLATE_PRESETS) {
     merged.templatePresets.push({ label: "Google マップ", template: MAPS_SEARCH_TEMPLATE });
+  }
+  const hasYouTubeTop = merged.templatePresets.some((p) => String(p.template || "").includes("/yt-top?q={query}"));
+  if (!hasYouTubeTop && merged.templatePresets.length < MAX_TEMPLATE_PRESETS) {
+    merged.templatePresets.push({ label: "YouTube 即再生(近似)", template: "{host}/yt-top?q={query}" });
   }
   syncTemplatesFromPresets(merged);
 }
@@ -433,6 +441,63 @@ function getAudienceBaseUrl(req) {
   return getPublicBaseUrl() || `${req.protocol}://${req.get("host")}`;
 }
 
+function httpsGetJson(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (res) => {
+        let body = "";
+        res.on("data", (c) => (body += c));
+        res.on("end", () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            return reject(new Error(`HTTP ${res.statusCode}`));
+          }
+          try {
+            resolve(JSON.parse(body));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      })
+      .on("error", reject);
+  });
+}
+
+function youtubeSearchFallbackUrl(query) {
+  return `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+}
+
+async function pickTopViewedYouTubeVideoId(query) {
+  if (!YOUTUBE_API_KEY) return null;
+  const q = String(query || "").trim();
+  if (!q) return null;
+  const searchUrl =
+    "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=10" +
+    `&q=${encodeURIComponent(q)}` +
+    `&key=${encodeURIComponent(YOUTUBE_API_KEY)}`;
+  const search = await httpsGetJson(searchUrl);
+  const ids = (search.items || [])
+    .map((it) => (it && it.id && it.id.videoId ? String(it.id.videoId) : ""))
+    .filter(Boolean);
+  if (!ids.length) return null;
+  const videosUrl =
+    "https://www.googleapis.com/youtube/v3/videos?part=statistics&id=" +
+    encodeURIComponent(ids.join(",")) +
+    `&key=${encodeURIComponent(YOUTUBE_API_KEY)}`;
+  const videos = await httpsGetJson(videosUrl);
+  let bestId = null;
+  let bestViews = -1;
+  for (const v of videos.items || []) {
+    const id = String(v && v.id ? v.id : "");
+    const views = Number(v && v.statistics && v.statistics.viewCount ? v.statistics.viewCount : 0);
+    if (!id) continue;
+    if (views > bestViews) {
+      bestViews = views;
+      bestId = id;
+    }
+  }
+  return bestId;
+}
+
 /** 名刺の「いまの単語」: キーワード欄の上から最初の非空（マジシャンがスマホで入れた1語想定） */
 function firstNonEmptyQuery(state) {
   const queries = Array.isArray(state.queries) ? state.queries : [];
@@ -523,6 +588,21 @@ app.get("/api/version", (_req, res) => {
 app.get("/api/public-qr-hint", (req, res) => {
   const base = getPublicBaseUrl();
   res.json({ ok: true, publicBaseUrl: base || null });
+});
+
+/** 曲名などを受け取り、YouTubeの再生数上位動画へ直接リダイレクト（APIキー未設定時は検索結果へ） */
+app.get("/yt-top", async (req, res) => {
+  const q = String((req.query && req.query.q) || "").trim();
+  if (!q) return res.redirect(302, "https://www.youtube.com/");
+  try {
+    const bestId = await pickTopViewedYouTubeVideoId(q);
+    if (bestId) {
+      return res.redirect(302, `https://www.youtube.com/watch?v=${encodeURIComponent(bestId)}`);
+    }
+  } catch (e) {
+    console.error("[yt-top]", e && e.message ? e.message : e);
+  }
+  return res.redirect(302, youtubeSearchFallbackUrl(q));
 });
 
 /** IDログイン（8桁）。管理者ID=19940131 */

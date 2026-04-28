@@ -1,6 +1,6 @@
 {
   "name": "qr-magic",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "Personal QR redirect show (no login)",
   "main": "server.js",
