@@ -1,6 +1,6 @@
 {
   "name": "qr-magic",
-  "version": "1.0.10",
+  "version": "1.1.0",
   "private": true,
   "description": "Personal QR redirect show (no login)",
   "main": "server.js",
@@ -20,6 +20,8 @@
     "concurrently": "^9.1.0",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
-    "localtunnel": "^2.0.2"
+    "jszip": "^3.10.1",
+    "localtunnel": "^2.0.2",
+    "qrcode": "^1.5.4"
   }
 }

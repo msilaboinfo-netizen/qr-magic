@@ -25,6 +25,8 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const express = require("express");
+const QRCode = require("qrcode");
+const JSZip = require("jszip");
 
 /** Render 等のエフェメラルディスクでは消える。設定すると名刺URLもデプロイ後も残る */
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
@@ -106,10 +108,13 @@ function defaultState() {
     /** 名刺用キーワード: frozen=初回で固定 / recycle=常に管理画面のキーワードに追従 */
     ticketKeywordMode: "frozen",
     tickets: {},
+    /** 簡易アクセス履歴（最新が後ろ） */
+    scanEvents: [],
   };
 }
 
 const MAX_TEMPLATE_PRESETS = 20;
+const MAX_SCAN_EVENTS = 1000;
 
 function syncTemplatesFromPresets(state) {
   const presets = Array.isArray(state.templatePresets) ? state.templatePresets : [];
@@ -157,6 +162,37 @@ function normalizeTicketKeywordMode(s) {
   s.ticketKeywordMode = s.ticketKeywordMode === "recycle" ? "recycle" : "frozen";
 }
 
+function normalizeScanEventsOnRead(merged) {
+  const arr = Array.isArray(merged.scanEvents) ? merged.scanEvents : [];
+  merged.scanEvents = arr
+    .filter((e) => e && typeof e === "object")
+    .map((e) => ({
+      at: typeof e.at === "string" && e.at ? e.at : null,
+      token: typeof e.token === "string" ? e.token : "",
+      path: typeof e.path === "string" ? e.path : "",
+      query: typeof e.query === "string" ? e.query : "",
+    }))
+    .filter((e) => e.at && e.token && e.path)
+    .slice(-MAX_SCAN_EVENTS);
+}
+
+function ensureTicketStats(ticket) {
+  const t = ticket && typeof ticket === "object" ? ticket : {};
+  const c = Number(t.hitCount);
+  t.hitCount = Number.isFinite(c) && c >= 0 ? Math.floor(c) : 0;
+  t.createdAt = typeof t.createdAt === "string" && t.createdAt ? t.createdAt : null;
+  t.lastHitAt = typeof t.lastHitAt === "string" && t.lastHitAt ? t.lastHitAt : null;
+  return t;
+}
+
+function appendScanEvent(state, event) {
+  if (!Array.isArray(state.scanEvents)) state.scanEvents = [];
+  state.scanEvents.push(event);
+  if (state.scanEvents.length > MAX_SCAN_EVENTS) {
+    state.scanEvents = state.scanEvents.slice(-MAX_SCAN_EVENTS);
+  }
+}
+
 /** キーワードは1語だけ。旧データの複数行は先頭の非空1つに畳む */
 function normalizeQueriesToSingle(queries) {
   const arr = Array.isArray(queries) ? queries : [""];
@@ -171,6 +207,7 @@ function hydrateMergedState(parsed) {
   const merged = { ...defaultState(), ...(parsed && typeof parsed === "object" ? parsed : {}) };
   merged.queries = normalizeQueriesToSingle(merged.queries);
   normalizeTicketsOnRead(merged);
+  normalizeScanEventsOnRead(merged);
   migrateTemplatePresets(merged);
   normalizeTicketKeywordMode(merged);
   return merged;
@@ -272,6 +309,10 @@ function buildUrl(template, query, req) {
     .replaceAll("{query}", encodeURIComponent(query));
 }
 
+function getAudienceBaseUrl(req) {
+  return getPublicBaseUrl() || `${req.protocol}://${req.get("host")}`;
+}
+
 /** 名刺の「いまの単語」: キーワード欄の上から最初の非空（マジシャンがスマホで入れた1語想定） */
 function firstNonEmptyQuery(state) {
   const queries = Array.isArray(state.queries) ? state.queries : [];
@@ -302,14 +343,17 @@ function normalizeTicketsOnRead(merged) {
     if (v == null) continue;
     if (typeof v === "string") {
       const q = v.trim();
-      out[key] = { query: q.length ? q : null, template: null };
+      out[key] = ensureTicketStats({ query: q.length ? q : null, template: null });
       continue;
     }
     if (typeof v === "object") {
-      out[key] = {
+      out[key] = ensureTicketStats({
         query: v.query == null || String(v.query).trim() === "" ? null : v.query,
         template: v.template == null ? null : v.template,
-      };
+        hitCount: v.hitCount,
+        createdAt: v.createdAt,
+        lastHitAt: v.lastHitAt,
+      });
     }
   }
   merged.tickets = out;
@@ -382,13 +426,11 @@ app.get("/r/:token", async (req, res) => {
       t.template && String(t.template).includes("{query}")
         ? String(t.template)
         : state.serviceTemplate || defaultState().serviceTemplate;
+    let chosenQuery = null;
 
     if (ticketQueryBound(t)) {
-      const url = buildUrl(tmpl, String(t.query || "").trim(), req);
-      return res.redirect(302, url);
-    }
-
-    if (recycle) {
+      chosenQuery = String(t.query || "").trim();
+    } else if (recycle) {
       const live = firstNonEmptyQuery(state);
       if (!live) {
         return res.status(503).type("html").send(`<!DOCTYPE html>
@@ -401,13 +443,11 @@ app.get("/r/:token", async (req, res) => {
 <p style="color:#555;font-size:.9rem">リサイクルでは、まだ永久化で固定されていない名刺URLだけが、保存中のキーワードに追従します。</p>
 </body></html>`);
       }
-      const url = buildUrl(tmpl, live, req);
-      return res.redirect(302, url);
-    }
-
-    const live = firstNonEmptyQuery(state);
-    if (!live) {
-      return res.status(503).type("html").send(`<!DOCTYPE html>
+      chosenQuery = live;
+    } else {
+      const live = firstNonEmptyQuery(state);
+      if (!live) {
+        return res.status(503).type("html").send(`<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>名刺QR</title></head>
@@ -416,15 +456,29 @@ app.get("/r/:token", async (req, res) => {
 <p>マジシャン側の管理画面で、キーワードを入力して <strong>「設定を保存」</strong> してから、もう一度このQRを読み取ってください。</p>
 <p style="color:#555;font-size:.9rem">永久化では、この初回で単語がこの名刺URLに固定され、あとから変わりません。</p>
 </body></html>`);
+      }
+      chosenQuery = live;
+      state.tickets[ticketKey].query = live;
     }
-    state.tickets[ticketKey].query = live;
+    const now = new Date().toISOString();
+    const activeTicket = ensureTicketStats(state.tickets[ticketKey] || {});
+    activeTicket.hitCount += 1;
+    activeTicket.lastHitAt = now;
+    if (!activeTicket.createdAt) activeTicket.createdAt = now;
+    state.tickets[ticketKey] = activeTicket;
+    appendScanEvent(state, {
+      at: now,
+      token: ticketKey,
+      path: `/r/${ticketKey}`,
+      query: String(chosenQuery || ""),
+    });
     try {
       await writeState(state);
     } catch (e) {
       console.error(e);
       return res.status(500).type("text/plain").send("Server error");
     }
-    const url = buildUrl(tmpl, live, req);
+    const url = buildUrl(tmpl, chosenQuery, req);
     return res.redirect(302, url);
   }
 
@@ -546,7 +600,104 @@ app.get("/api/tickets", adminAuth, async (req, res) => {
     state.tickets && typeof state.tickets === "object" && !Array.isArray(state.tickets) ? state.tickets : {};
   const keys = Object.keys(tickets).sort();
   const paths = keys.map((tok) => `/r/${tok}`);
-  res.json({ ok: true, ticketCount: paths.length, paths });
+  const rows = keys.map((tok) => {
+    const t = ensureTicketStats(tickets[tok] || {});
+    return {
+      token: tok,
+      path: `/r/${tok}`,
+      hitCount: t.hitCount,
+      createdAt: t.createdAt,
+      lastHitAt: t.lastHitAt,
+      queryBound: ticketQueryBound(t),
+      query: t.query == null ? null : String(t.query),
+    };
+  });
+  res.json({ ok: true, ticketCount: paths.length, paths, tickets: rows });
+});
+
+/** 設定ドロワー向け: 簡易アクセス履歴（合計・各URL・直近イベント） */
+app.get("/api/tickets/history", adminAuth, async (req, res) => {
+  let state;
+  try {
+    state = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+  }
+  const tickets =
+    state.tickets && typeof state.tickets === "object" && !Array.isArray(state.tickets) ? state.tickets : {};
+  const keys = Object.keys(tickets).sort();
+  const rows = keys.map((tok) => {
+    const t = ensureTicketStats(tickets[tok] || {});
+    return {
+      token: tok,
+      path: `/r/${tok}`,
+      hitCount: t.hitCount,
+      createdAt: t.createdAt,
+      lastHitAt: t.lastHitAt,
+      queryBound: ticketQueryBound(t),
+      query: t.query == null ? null : String(t.query),
+    };
+  });
+  rows.sort((a, b) => b.hitCount - a.hitCount || a.path.localeCompare(b.path));
+  const totalHits = rows.reduce((sum, r) => sum + r.hitCount, 0);
+  const events = (Array.isArray(state.scanEvents) ? state.scanEvents : []).slice(-200).reverse();
+  res.json({
+    ok: true,
+    ticketCount: rows.length,
+    totalHits,
+    tickets: rows,
+    recentEvents: events,
+  });
+});
+
+/** 設定ドロワー向け: 発行済みQRを PNG でまとめて ZIP ダウンロード */
+app.get("/api/tickets/qr-zip", adminAuth, async (req, res) => {
+  let state;
+  try {
+    state = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+  }
+  const tickets =
+    state.tickets && typeof state.tickets === "object" && !Array.isArray(state.tickets) ? state.tickets : {};
+  const keys = Object.keys(tickets).sort();
+  if (keys.length === 0) {
+    return res.status(400).json({ ok: false, message: "名刺用URLがありません" });
+  }
+  const base = String(getAudienceBaseUrl(req)).replace(/\/+$/, "");
+  try {
+    const zip = new JSZip();
+    const lines = [];
+    for (let i = 0; i < keys.length; i++) {
+      const tok = keys[i];
+      const pathPart = `/r/${tok}`;
+      const fullUrl = `${base}${pathPart}`;
+      lines.push(fullUrl);
+      const png = await QRCode.toBuffer(fullUrl, {
+        type: "png",
+        width: 512,
+        margin: 1,
+        errorCorrectionLevel: "M",
+      });
+      const fileName = `${String(i + 1).padStart(4, "0")}_${tok}.png`;
+      zip.file(`qrs/${fileName}`, png);
+    }
+    zip.file("ticket-urls.txt", lines.join("\n"));
+    const zipBuf = await zip.generateAsync({
+      type: "nodebuffer",
+      compression: "DEFLATE",
+      compressionOptions: { level: 6 },
+    });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename=\"qr-tickets-${stamp}.zip\"`);
+    return res.status(200).send(zipBuf);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "ZIP生成に失敗しました" });
+  }
 });
 
 /** 名刺用URLを count 枚ぶん発行（単語は未割当。frozen なら初回で固定、recycle なら常に現在キーワード） */
@@ -575,7 +726,13 @@ app.post("/api/tickets/bulk", adminAuth, async (req, res) => {
     if (guard >= 50) {
       return res.status(500).json({ ok: false, message: "トークン生成に失敗しました" });
     }
-    cur.tickets[tok] = { query: null, template: null };
+    cur.tickets[tok] = ensureTicketStats({
+      query: null,
+      template: null,
+      createdAt: new Date().toISOString(),
+      hitCount: 0,
+      lastHitAt: null,
+    });
     created.push({ token: tok, path: `/r/${tok}` });
   }
   try {
@@ -600,6 +757,7 @@ app.post("/api/tickets/clear", adminAuth, async (req, res) => {
     return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
   }
   cur.tickets = {};
+  cur.scanEvents = [];
   try {
     await writeState(cur);
   } catch (e) {

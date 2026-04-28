@@ -84,16 +84,35 @@
   <div class="settingsBackdrop" id="settingsBackdrop" aria-hidden="true"></div>
   <div class="settingsDrawer" id="settingsDrawer" role="dialog" aria-modal="true" aria-labelledby="settingsDrawerTitle">
     <div class="settingsDrawerHead">
-      <h2 id="settingsDrawerTitle">有効な名刺用URL</h2>
+      <h2 id="settingsDrawerTitle">設定</h2>
       <button type="button" class="btn-secondary" id="btnCloseSettings" style="padding:0.4rem 0.65rem;font-size:0.82rem">閉じる</button>
     </div>
     <div class="settingsDrawerBody">
+      <h3 style="font-size:0.88rem;margin:0 0 .35rem">有効な名刺用URL</h3>
       <p id="settingsUrlMeta" class="muted" style="margin:0 0 0.5rem;font-size:0.8rem"></p>
       <div class="toolbar" style="margin-top:0;margin-bottom:0.5rem">
         <button type="button" class="btn-secondary" id="btnRefreshUrlList" style="font-size:0.85rem;padding:0.45rem 0.75rem">一覧を更新</button>
       </div>
       <label class="muted" for="settingsUrlList" style="font-size:0.78rem">1行1本（コピー可）</label>
-      <textarea id="settingsUrlList" readonly rows="14" style="margin-top:0.35rem"></textarea>
+      <textarea id="settingsUrlList" readonly rows="8" style="margin-top:0.35rem"></textarea>
+
+      <hr style="margin:0.9rem 0;border:none;border-top:1px solid #eee" />
+      <h3 style="font-size:0.88rem;margin:0 0 .35rem">アクセス履歴（簡易）</h3>
+      <p id="settingsHistoryMeta" class="muted" style="margin:0 0 0.5rem;font-size:0.8rem"></p>
+      <div class="toolbar" style="margin-top:0;margin-bottom:0.5rem">
+        <button type="button" class="btn-secondary" id="btnRefreshHistory" style="font-size:0.85rem;padding:0.45rem 0.75rem">履歴を更新</button>
+      </div>
+      <label class="muted" for="settingsHistoryList" style="font-size:0.78rem">URLごとの読取回数</label>
+      <textarea id="settingsHistoryList" readonly rows="6" style="margin-top:0.35rem"></textarea>
+      <label class="muted" for="settingsRecentEvents" style="display:block;margin-top:.45rem;font-size:0.78rem">直近の読取イベント（新しい順）</label>
+      <textarea id="settingsRecentEvents" readonly rows="6" style="margin-top:0.35rem"></textarea>
+
+      <hr style="margin:0.9rem 0;border:none;border-top:1px solid #eee" />
+      <h3 style="font-size:0.88rem;margin:0 0 .35rem">QR一括画像ダウンロード</h3>
+      <p class="muted" style="margin:0 0 0.5rem;font-size:0.8rem">発行済み名刺URLをPNG化して ZIP で保存します。</p>
+      <div class="toolbar" style="margin-top:0;margin-bottom:0.5rem">
+        <button type="button" class="btn-primary" id="btnDownloadQrZip" style="font-size:0.85rem;padding:0.45rem 0.75rem">ZIPをダウンロード</button>
+      </div>
     </div>
   </div>
 
@@ -209,6 +228,7 @@
       document.getElementById("btnOpenSettings").setAttribute("aria-expanded", "true");
       document.getElementById("settingsBackdrop").setAttribute("aria-hidden", "false");
       loadActiveTicketUrlsIntoDrawer();
+      loadTicketHistoryIntoDrawer();
     }
 
     function closeSettingsDrawer() {
@@ -232,6 +252,65 @@
         ta.value = paths.map((p) => base + p).join("\n");
       } catch (e) {
         meta.textContent = "";
+        toast(String(e.message || e));
+      }
+    }
+
+    function fmtDateTime(s) {
+      if (!s) return "—";
+      const d = new Date(s);
+      if (Number.isNaN(d.getTime())) return s;
+      return d.toLocaleString("ja-JP");
+    }
+
+    async function loadTicketHistoryIntoDrawer() {
+      const meta = document.getElementById("settingsHistoryMeta");
+      const sumTa = document.getElementById("settingsHistoryList");
+      const evTa = document.getElementById("settingsRecentEvents");
+      meta.textContent = "読み込み中…";
+      sumTa.value = "";
+      evTa.value = "";
+      try {
+        const d = await api("/api/tickets/history");
+        meta.textContent =
+          "URL " + (d.ticketCount != null ? d.ticketCount : 0) + " 本 / 合計読取 " + (d.totalHits != null ? d.totalHits : 0) + " 回";
+        const rows = Array.isArray(d.tickets) ? d.tickets : [];
+        sumTa.value = rows
+          .map((r) => {
+            const latest = r.lastHitAt ? fmtDateTime(r.lastHitAt) : "未読取";
+            return `${r.path}  |  ${r.hitCount} 回  |  最終: ${latest}`;
+          })
+          .join("\n");
+        const evs = Array.isArray(d.recentEvents) ? d.recentEvents : [];
+        evTa.value = evs
+          .map((e) => `${fmtDateTime(e.at)}  ${e.path}  query=${e.query || "-"}`)
+          .join("\n");
+      } catch (e) {
+        meta.textContent = "";
+        toast(String(e.message || e));
+      }
+    }
+
+    async function downloadTicketQrsZip() {
+      try {
+        const r = await fetch("/api/tickets/qr-zip", { headers: authHeaders() });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          throw new Error(j.message || r.statusText || "download failed");
+        }
+        const blob = await r.blob();
+        const a = document.createElement("a");
+        const cd = r.headers.get("content-disposition") || "";
+        const m = cd.match(/filename=\"?([^\";]+)\"?/i);
+        const fn = (m && m[1]) || "qr-tickets.zip";
+        a.href = URL.createObjectURL(blob);
+        a.download = fn;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        toast("ZIPをダウンロードしました");
+      } catch (e) {
         toast(String(e.message || e));
       }
     }
@@ -389,6 +468,10 @@
     document.getElementById("btnRefreshUrlList").onclick = () => {
       if (isSettingsDrawerOpen()) loadActiveTicketUrlsIntoDrawer();
     };
+    document.getElementById("btnRefreshHistory").onclick = () => {
+      if (isSettingsDrawerOpen()) loadTicketHistoryIntoDrawer();
+    };
+    document.getElementById("btnDownloadQrZip").onclick = () => downloadTicketQrsZip();
 
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && isSettingsDrawerOpen()) closeSettingsDrawer();
