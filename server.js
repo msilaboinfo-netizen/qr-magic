@@ -1,5 +1,5 @@
 /**
- * Personal QR: name-card URLs bind on first scan; admin is ADMIN_TOKEN.
+ * Personal QR: name-card URLs bind on first scan; login is 8-digit ID.
  * Legacy /r/PUBLIC_TOKEN is retired (404). Tickets use /r/:randomToken.
  */
 require("dotenv").config();
@@ -50,8 +50,8 @@ function getSupabase() {
 }
 
 const PORT = Number(process.env.PORT || 3333);
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "dev-admin-change-me";
 const PUBLIC_TOKEN = process.env.PUBLIC_TOKEN || "dev-public-change-me";
+const ADMIN_ID = "19940131";
 
 const DATA_DIR = path.join(__dirname, "data");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
@@ -110,6 +110,12 @@ function defaultState() {
     tickets: {},
     /** 簡易アクセス履歴（最新が後ろ） */
     scanEvents: [],
+    /** ログイン用ID一覧（8桁数字） */
+    loginCodes: {
+      [ADMIN_ID]: { role: "admin", active: true, createdAt: new Date().toISOString() },
+    },
+    /** セッション（token -> {id,role,createdAt}） */
+    sessions: {},
   };
 }
 
@@ -162,6 +168,59 @@ function normalizeTicketKeywordMode(s) {
   s.ticketKeywordMode = s.ticketKeywordMode === "recycle" ? "recycle" : "frozen";
 }
 
+function normalizeLoginCodesOnRead(merged) {
+  const raw = merged.loginCodes && typeof merged.loginCodes === "object" ? merged.loginCodes : {};
+  const out = {};
+  for (const k of Object.keys(raw)) {
+    const id = String(k || "").trim();
+    if (!/^\d{8}$/.test(id)) continue;
+    const v = raw[k] && typeof raw[k] === "object" ? raw[k] : {};
+    const role = id === ADMIN_ID ? "admin" : "user";
+    out[id] = {
+      role,
+      active: v.active !== false,
+      createdAt: typeof v.createdAt === "string" && v.createdAt ? v.createdAt : null,
+      revokedAt: typeof v.revokedAt === "string" && v.revokedAt ? v.revokedAt : null,
+    };
+  }
+  if (!out[ADMIN_ID]) {
+    out[ADMIN_ID] = { role: "admin", active: true, createdAt: new Date().toISOString(), revokedAt: null };
+  } else {
+    out[ADMIN_ID].role = "admin";
+    out[ADMIN_ID].active = true;
+    out[ADMIN_ID].revokedAt = null;
+  }
+  merged.loginCodes = out;
+}
+
+function normalizeSessionsOnRead(merged) {
+  const raw = merged.sessions && typeof merged.sessions === "object" ? merged.sessions : {};
+  const out = {};
+  for (const tok of Object.keys(raw)) {
+    const s = raw[tok];
+    if (!tok || !s || typeof s !== "object") continue;
+    const id = String(s.id || "").trim();
+    const role = s.role === "admin" ? "admin" : "user";
+    if (!/^\d{8}$/.test(id)) continue;
+    out[tok] = {
+      id,
+      role,
+      createdAt: typeof s.createdAt === "string" && s.createdAt ? s.createdAt : null,
+    };
+  }
+  merged.sessions = out;
+}
+
+function normalizeTicketOwnersOnRead(merged) {
+  const tickets = merged.tickets && typeof merged.tickets === "object" ? merged.tickets : {};
+  for (const tok of Object.keys(tickets)) {
+    const t = tickets[tok];
+    if (!t || typeof t !== "object") continue;
+    const owner = String(t.ownerId || "").trim();
+    t.ownerId = /^\d{8}$/.test(owner) ? owner : ADMIN_ID;
+  }
+}
+
 function normalizeScanEventsOnRead(merged) {
   const arr = Array.isArray(merged.scanEvents) ? merged.scanEvents : [];
   merged.scanEvents = arr
@@ -171,6 +230,7 @@ function normalizeScanEventsOnRead(merged) {
       token: typeof e.token === "string" ? e.token : "",
       path: typeof e.path === "string" ? e.path : "",
       query: typeof e.query === "string" ? e.query : "",
+      ownerId: /^\d{8}$/.test(String(e.ownerId || "").trim()) ? String(e.ownerId).trim() : ADMIN_ID,
     }))
     .filter((e) => e.at && e.token && e.path)
     .slice(-MAX_SCAN_EVENTS);
@@ -182,6 +242,7 @@ function ensureTicketStats(ticket) {
   t.hitCount = Number.isFinite(c) && c >= 0 ? Math.floor(c) : 0;
   t.createdAt = typeof t.createdAt === "string" && t.createdAt ? t.createdAt : null;
   t.lastHitAt = typeof t.lastHitAt === "string" && t.lastHitAt ? t.lastHitAt : null;
+  t.ownerId = /^\d{8}$/.test(String(t.ownerId || "").trim()) ? String(t.ownerId).trim() : ADMIN_ID;
   return t;
 }
 
@@ -191,6 +252,15 @@ function appendScanEvent(state, event) {
   if (state.scanEvents.length > MAX_SCAN_EVENTS) {
     state.scanEvents = state.scanEvents.slice(-MAX_SCAN_EVENTS);
   }
+}
+
+function countOwnedTickets(state, actor) {
+  const tickets = state.tickets && typeof state.tickets === "object" ? state.tickets : {};
+  return Object.keys(tickets).filter((tok) => {
+    if (isAdminActor(actor)) return true;
+    const t = tickets[tok];
+    return t && String(t.ownerId || "") === actor.id;
+  }).length;
 }
 
 /** キーワードは1語だけ。旧データの複数行は先頭の非空1つに畳む */
@@ -207,7 +277,10 @@ function hydrateMergedState(parsed) {
   const merged = { ...defaultState(), ...(parsed && typeof parsed === "object" ? parsed : {}) };
   merged.queries = normalizeQueriesToSingle(merged.queries);
   normalizeTicketsOnRead(merged);
+  normalizeTicketOwnersOnRead(merged);
   normalizeScanEventsOnRead(merged);
+  normalizeLoginCodesOnRead(merged);
+  normalizeSessionsOnRead(merged);
   migrateTemplatePresets(merged);
   normalizeTicketKeywordMode(merged);
   return merged;
@@ -293,12 +366,59 @@ async function writeState(state) {
   writeStateToFileSync(state);
 }
 
-function adminAuth(req, res, next) {
+function bearerToken(req) {
   const auth = req.headers.authorization || "";
-  const want = `Bearer ${ADMIN_TOKEN}`;
-  if (auth !== want) {
-    return res.status(401).json({ ok: false, message: "Unauthorized" });
+  if (!auth.startsWith("Bearer ")) return "";
+  return auth.slice("Bearer ".length).trim();
+}
+
+function isAdminActor(actor) {
+  return actor && actor.role === "admin";
+}
+
+function issueSessionToken() {
+  return crypto.randomBytes(24).toString("hex");
+}
+
+function generateUserLoginId(state) {
+  if (!state.loginCodes || typeof state.loginCodes !== "object") state.loginCodes = {};
+  let id = "";
+  let guard = 0;
+  do {
+    id = String(Math.floor(10000000 + Math.random() * 90000000));
+    guard++;
+  } while ((id === ADMIN_ID || state.loginCodes[id]) && guard < 200);
+  if (!/^\d{8}$/.test(id) || state.loginCodes[id]) {
+    throw new Error("ID generation failed");
   }
+  return id;
+}
+
+function authRequired(req, res, next) {
+  const token = bearerToken(req);
+  if (!token) return res.status(401).json({ ok: false, message: "Unauthorized" });
+  readState()
+    .then((state) => {
+      const session = state.sessions && state.sessions[token];
+      if (!session) return res.status(401).json({ ok: false, message: "Unauthorized" });
+      const code = state.loginCodes && state.loginCodes[session.id];
+      if (!code || code.active === false) return res.status(401).json({ ok: false, message: "Unauthorized" });
+      req.auth = {
+        token,
+        id: session.id,
+        role: session.role === "admin" ? "admin" : "user",
+      };
+      req.authState = state;
+      return next();
+    })
+    .catch((e) => {
+      console.error(e);
+      res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+    });
+}
+
+function adminOnly(req, res, next) {
+  if (!isAdminActor(req.auth)) return res.status(403).json({ ok: false, message: "forbidden" });
   next();
 }
 
@@ -343,7 +463,7 @@ function normalizeTicketsOnRead(merged) {
     if (v == null) continue;
     if (typeof v === "string") {
       const q = v.trim();
-      out[key] = ensureTicketStats({ query: q.length ? q : null, template: null });
+      out[key] = ensureTicketStats({ query: q.length ? q : null, template: null, ownerId: ADMIN_ID });
       continue;
     }
     if (typeof v === "object") {
@@ -353,6 +473,7 @@ function normalizeTicketsOnRead(merged) {
         hitCount: v.hitCount,
         createdAt: v.createdAt,
         lastHitAt: v.lastHitAt,
+        ownerId: /^\d{8}$/.test(String(v.ownerId || "").trim()) ? String(v.ownerId).trim() : ADMIN_ID,
       });
     }
   }
@@ -402,6 +523,62 @@ app.get("/api/version", (_req, res) => {
 app.get("/api/public-qr-hint", (req, res) => {
   const base = getPublicBaseUrl();
   res.json({ ok: true, publicBaseUrl: base || null });
+});
+
+/** IDログイン（8桁）。管理者ID=19940131 */
+app.post("/api/login", async (req, res) => {
+  const id = String((req.body && req.body.id) || "").trim();
+  if (!/^\d{8}$/.test(id)) {
+    return res.status(400).json({ ok: false, message: "IDは8桁の数字です" });
+  }
+  let state;
+  try {
+    state = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+  }
+  const code = state.loginCodes && state.loginCodes[id];
+  if (!code || code.active === false) {
+    return res.status(401).json({ ok: false, message: "IDが無効です" });
+  }
+  const role = id === ADMIN_ID ? "admin" : "user";
+  if (!state.sessions || typeof state.sessions !== "object") state.sessions = {};
+  if (role !== "admin") {
+    for (const tok of Object.keys(state.sessions)) {
+      if (state.sessions[tok] && state.sessions[tok].id === id) delete state.sessions[tok];
+    }
+  }
+  const token = issueSessionToken();
+  state.sessions[token] = {
+    id,
+    role,
+    createdAt: new Date().toISOString(),
+  };
+  try {
+    await writeState(state);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "ログイン保存に失敗しました" });
+  }
+  return res.json({
+    ok: true,
+    token,
+    actor: { id, role },
+  });
+});
+
+app.post("/api/logout", authRequired, async (req, res) => {
+  const state = req.authState || (await readState());
+  if (state.sessions && typeof state.sessions === "object") {
+    delete state.sessions[req.auth.token];
+  }
+  try {
+    await writeState(state);
+  } catch (e) {
+    console.error(e);
+  }
+  res.json({ ok: true });
 });
 
 /** Spectator scan */
@@ -471,6 +648,7 @@ app.get("/r/:token", async (req, res) => {
       token: ticketKey,
       path: `/r/${ticketKey}`,
       query: String(chosenQuery || ""),
+      ownerId: activeTicket.ownerId || ADMIN_ID,
     });
     try {
       await writeState(state);
@@ -498,7 +676,7 @@ app.get("/r/:token", async (req, res) => {
 });
 
 /** Admin API */
-app.get("/api/state", adminAuth, async (req, res) => {
+app.get("/api/state", authRequired, async (req, res) => {
   let state;
   try {
     state = await readState();
@@ -509,18 +687,19 @@ app.get("/api/state", adminAuth, async (req, res) => {
   res.json({
     ok: true,
     publicBaseUrl: getPublicBaseUrl() || null,
+    actor: req.auth,
     state: {
       queries: state.queries,
       serviceTemplate: state.serviceTemplate,
       templatePresets: state.templatePresets,
       activeTemplateIndex: state.activeTemplateIndex,
       ticketKeywordMode: state.ticketKeywordMode,
-      ticketCount: Object.keys(state.tickets || {}).length,
+      ticketCount: countOwnedTickets(state, req.auth),
     },
   });
 });
 
-app.put("/api/state", adminAuth, async (req, res) => {
+app.put("/api/state", authRequired, async (req, res) => {
   let cur;
   try {
     cur = await readState();
@@ -583,12 +762,98 @@ app.put("/api/state", adminAuth, async (req, res) => {
   }
   res.json({
     ok: true,
-    state: { ...next, ticketCount: Object.keys(next.tickets || {}).length },
+    state: { ...next, ticketCount: countOwnedTickets(next, req.auth) },
   });
 });
 
+/** 管理者用: ログインID一覧 */
+app.get("/api/admin/codes", authRequired, adminOnly, async (req, res) => {
+  let state;
+  try {
+    state = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+  }
+  const rows = Object.keys(state.loginCodes || {})
+    .sort()
+    .map((id) => ({
+      id,
+      role: id === ADMIN_ID ? "admin" : "user",
+      active: state.loginCodes[id].active !== false,
+      createdAt: state.loginCodes[id].createdAt || null,
+      revokedAt: state.loginCodes[id].revokedAt || null,
+    }));
+  res.json({ ok: true, codes: rows });
+});
+
+/** 管理者用: ユーザーIDを一括発行 */
+app.post("/api/admin/codes/bulk", authRequired, adminOnly, async (req, res) => {
+  const raw = parseInt(req.body && req.body.count, 10);
+  const count = Math.min(5000, Math.max(1, Number.isFinite(raw) ? raw : 0));
+  if (!count) return res.status(400).json({ ok: false, message: "count は 1〜5000" });
+  let state;
+  try {
+    state = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+  }
+  if (!state.loginCodes || typeof state.loginCodes !== "object") state.loginCodes = {};
+  const created = [];
+  for (let i = 0; i < count; i++) {
+    const id = generateUserLoginId(state);
+    state.loginCodes[id] = {
+      role: "user",
+      active: true,
+      createdAt: new Date().toISOString(),
+      revokedAt: null,
+    };
+    created.push(id);
+  }
+  try {
+    await writeState(state);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "保存に失敗しました" });
+  }
+  res.json({ ok: true, ids: created, total: Object.keys(state.loginCodes || {}).length });
+});
+
+/** 管理者用: IDを即時無効化 */
+app.post("/api/admin/codes/revoke", authRequired, adminOnly, async (req, res) => {
+  const id = String((req.body && req.body.id) || "").trim();
+  if (!/^\d{8}$/.test(id) || id === ADMIN_ID) {
+    return res.status(400).json({ ok: false, message: "無効化できないIDです" });
+  }
+  let state;
+  try {
+    state = await readState();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
+  }
+  if (!state.loginCodes || !state.loginCodes[id]) {
+    return res.status(404).json({ ok: false, message: "IDが見つかりません" });
+  }
+  state.loginCodes[id].active = false;
+  state.loginCodes[id].revokedAt = new Date().toISOString();
+  if (state.sessions && typeof state.sessions === "object") {
+    for (const tok of Object.keys(state.sessions)) {
+      if (state.sessions[tok] && state.sessions[tok].id === id) delete state.sessions[tok];
+    }
+  }
+  try {
+    await writeState(state);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, message: "保存に失敗しました" });
+  }
+  res.json({ ok: true });
+});
+
 /** 登録中の名刺用パス一覧（管理画面の設定メニュー用） */
-app.get("/api/tickets", adminAuth, async (req, res) => {
+app.get("/api/tickets", authRequired, async (req, res) => {
   let state;
   try {
     state = await readState();
@@ -598,7 +863,10 @@ app.get("/api/tickets", adminAuth, async (req, res) => {
   }
   const tickets =
     state.tickets && typeof state.tickets === "object" && !Array.isArray(state.tickets) ? state.tickets : {};
-  const keysAll = Object.keys(tickets).sort();
+  const actorId = req.auth.id;
+  const keysAll = Object.keys(tickets)
+    .filter((tok) => isAdminActor(req.auth) || String(tickets[tok].ownerId || "") === actorId)
+    .sort();
   /** 永久化でキーワード固定済みの名刺は「未印刷用一覧」から除外 */
   const keys = keysAll.filter((tok) => !ticketQueryBound(ensureTicketStats(tickets[tok] || {})));
   const paths = keys.map((tok) => `/r/${tok}`);
@@ -624,7 +892,7 @@ app.get("/api/tickets", adminAuth, async (req, res) => {
 });
 
 /** 設定ドロワー向け: 簡易アクセス履歴（合計・各URL・直近イベント） */
-app.get("/api/tickets/history", adminAuth, async (req, res) => {
+app.get("/api/tickets/history", authRequired, async (req, res) => {
   let state;
   try {
     state = await readState();
@@ -634,7 +902,10 @@ app.get("/api/tickets/history", adminAuth, async (req, res) => {
   }
   const tickets =
     state.tickets && typeof state.tickets === "object" && !Array.isArray(state.tickets) ? state.tickets : {};
-  const keys = Object.keys(tickets).sort();
+  const actorId = req.auth.id;
+  const keys = Object.keys(tickets)
+    .filter((tok) => isAdminActor(req.auth) || String(tickets[tok].ownerId || "") === actorId)
+    .sort();
   const rows = keys.map((tok) => {
     const t = ensureTicketStats(tickets[tok] || {});
     return {
@@ -649,7 +920,10 @@ app.get("/api/tickets/history", adminAuth, async (req, res) => {
   });
   rows.sort((a, b) => b.hitCount - a.hitCount || a.path.localeCompare(b.path));
   const totalHits = rows.reduce((sum, r) => sum + r.hitCount, 0);
-  const events = (Array.isArray(state.scanEvents) ? state.scanEvents : []).slice(-200).reverse();
+  const events = (Array.isArray(state.scanEvents) ? state.scanEvents : [])
+    .filter((e) => isAdminActor(req.auth) || String(e.ownerId || "") === actorId)
+    .slice(-200)
+    .reverse();
   res.json({
     ok: true,
     ticketCount: rows.length,
@@ -660,7 +934,7 @@ app.get("/api/tickets/history", adminAuth, async (req, res) => {
 });
 
 /** 設定ドロワー向け: 発行済みQRを PNG でまとめて ZIP ダウンロード */
-app.get("/api/tickets/qr-zip", adminAuth, async (req, res) => {
+app.get("/api/tickets/qr-zip", authRequired, async (req, res) => {
   let state;
   try {
     state = await readState();
@@ -670,7 +944,10 @@ app.get("/api/tickets/qr-zip", adminAuth, async (req, res) => {
   }
   const tickets =
     state.tickets && typeof state.tickets === "object" && !Array.isArray(state.tickets) ? state.tickets : {};
-  const keys = Object.keys(tickets).sort();
+  const actorId = req.auth.id;
+  const keys = Object.keys(tickets)
+    .filter((tok) => isAdminActor(req.auth) || String(tickets[tok].ownerId || "") === actorId)
+    .sort();
   if (keys.length === 0) {
     return res.status(400).json({ ok: false, message: "名刺用URLがありません" });
   }
@@ -709,7 +986,7 @@ app.get("/api/tickets/qr-zip", adminAuth, async (req, res) => {
 });
 
 /** 名刺用URLを count 枚ぶん発行（単語は未割当。frozen なら初回で固定、recycle なら常に現在キーワード） */
-app.post("/api/tickets/bulk", adminAuth, async (req, res) => {
+app.post("/api/tickets/bulk", authRequired, async (req, res) => {
   const raw = parseInt(req.body && req.body.count, 10);
   const count = Math.min(5000, Math.max(1, Number.isFinite(raw) ? raw : 0));
   if (!count) {
@@ -740,6 +1017,7 @@ app.post("/api/tickets/bulk", adminAuth, async (req, res) => {
       createdAt: new Date().toISOString(),
       hitCount: 0,
       lastHitAt: null,
+      ownerId: req.auth.id,
     });
     created.push({ token: tok, path: `/r/${tok}` });
   }
@@ -749,11 +1027,11 @@ app.post("/api/tickets/bulk", adminAuth, async (req, res) => {
     console.error(e);
     return res.status(500).json({ ok: false, message: "保存に失敗しました（Supabase を確認）" });
   }
-  res.json({ ok: true, tickets: created, ticketCount: Object.keys(cur.tickets).length });
+  res.json({ ok: true, tickets: created, ticketCount: countOwnedTickets(cur, req.auth) });
 });
 
 /** 名刺用URLをすべて削除（確認用に body.confirm が true） */
-app.post("/api/tickets/clear", adminAuth, async (req, res) => {
+app.post("/api/tickets/clear", authRequired, async (req, res) => {
   if (!(req.body && req.body.confirm === true)) {
     return res.status(400).json({ ok: false, message: "body.confirm true が必要です" });
   }
@@ -764,15 +1042,31 @@ app.post("/api/tickets/clear", adminAuth, async (req, res) => {
     console.error(e);
     return res.status(500).json({ ok: false, message: "状態の読み込みに失敗しました" });
   }
-  cur.tickets = {};
-  cur.scanEvents = [];
+  if (isAdminActor(req.auth)) {
+    cur.tickets = {};
+    cur.scanEvents = [];
+  } else {
+    const own = req.auth.id;
+    const nextTickets = {};
+    for (const tok of Object.keys(cur.tickets || {})) {
+      const t = cur.tickets[tok];
+      if (!t || typeof t !== "object") continue;
+      if (String(t.ownerId || "") !== own) nextTickets[tok] = t;
+    }
+    cur.tickets = nextTickets;
+    cur.scanEvents = (Array.isArray(cur.scanEvents) ? cur.scanEvents : []).filter((e) => String(e.ownerId || "") !== own);
+  }
   try {
     await writeState(cur);
   } catch (e) {
     console.error(e);
     return res.status(500).json({ ok: false, message: "保存に失敗しました（Supabase を確認）" });
   }
-  res.json({ ok: true, ticketCount: 0 });
+  const remain = Object.keys(cur.tickets || {}).filter((tok) => {
+    const t = cur.tickets[tok];
+    return isAdminActor(req.auth) || String((t && t.ownerId) || "") === req.auth.id;
+  }).length;
+  res.json({ ok: true, ticketCount: remain });
 });
 
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -813,7 +1107,7 @@ app.use((req, res) => {
 
 app.listen(PORT, () => {
   console.log(`QR magic listening on http://localhost:${PORT}`);
-  console.log(`Admin: open http://localhost:${PORT}/  (Bearer ADMIN_TOKEN)`);
+  console.log(`Login: open http://localhost:${PORT}/  (8桁ID / 管理者ID=${ADMIN_ID})`);
   if (getSupabase()) {
     console.log(`状態の保存先: Supabase テーブル ${QR_MAGIC_STATE_TABLE}（デプロイ後も維持）`);
   } else {

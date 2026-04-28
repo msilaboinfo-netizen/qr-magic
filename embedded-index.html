@@ -113,17 +113,34 @@
       <div class="toolbar" style="margin-top:0;margin-bottom:0.5rem">
         <button type="button" class="btn-primary" id="btnDownloadQrZip" style="font-size:0.85rem;padding:0.45rem 0.75rem">ZIPをダウンロード</button>
       </div>
+
+      <div id="adminCodePanel" style="display:none">
+        <hr style="margin:0.9rem 0;border:none;border-top:1px solid #eee" />
+        <h3 style="font-size:0.88rem;margin:0 0 .35rem">配布用ログインID管理（管理者）</h3>
+        <p id="adminCodeMeta" class="muted" style="margin:0 0 0.5rem;font-size:0.8rem"></p>
+        <div class="toolbar" style="margin-top:0;margin-bottom:0.5rem">
+          <input type="number" id="adminIssueCount" value="50" min="1" max="5000" style="width:7rem" />
+          <button type="button" class="btn-primary" id="btnAdminIssueCodes" style="font-size:0.85rem;padding:0.45rem 0.75rem">IDを一括発行</button>
+          <button type="button" class="btn-secondary" id="btnAdminRefreshCodes" style="font-size:0.85rem;padding:0.45rem 0.75rem">一覧更新</button>
+        </div>
+        <label class="muted" for="adminCodeList" style="font-size:0.78rem">ID一覧（上ほど新しい）</label>
+        <textarea id="adminCodeList" readonly rows="8" style="margin-top:0.35rem"></textarea>
+        <div class="toolbar" style="margin-top:0.5rem">
+          <input type="text" id="adminRevokeCode" placeholder="停止する8桁ID" inputmode="numeric" maxlength="8" style="width:10rem" />
+          <button type="button" class="btn-danger" id="btnAdminRevokeCode" style="font-size:0.85rem;padding:0.45rem 0.75rem">IDを停止</button>
+        </div>
+      </div>
     </div>
   </div>
 
   <p id="appVersionBar" class="muted" style="font-size:0.82rem;margin:0 0 0.5rem">バージョン …</p>
   <h1>QR Magic（個人用）</h1>
-  <p class="muted">アカウントはありません。<code>ADMIN_TOKEN</code> を知っている人だけが設定できます。</p>
+  <p class="muted">8桁のログインIDで入ります。管理者IDは配布コードの発行と停止ができます。</p>
 
   <div id="gate" class="panel">
-    <h2>管理用トークン</h2>
-    <p class="muted">サーバーの環境変数 <code>ADMIN_TOKEN</code> と同じ文字列を入力してください。</p>
-    <input type="password" id="gateToken" placeholder="ADMIN_TOKEN" autocomplete="off" />
+    <h2>ログインID</h2>
+    <p class="muted">8桁の数字IDを入力してください（管理者IDも同じ欄で入力）。</p>
+    <input type="password" id="gateToken" placeholder="例: 12345678" autocomplete="off" />
     <div class="toolbar" style="margin-top:0.65rem">
       <button type="button" class="btn-primary" id="gateBtn">開く</button>
     </div>
@@ -176,11 +193,12 @@
   <p id="toast" style="display:none;position:fixed;bottom:1rem;left:50%;transform:translateX(-50%);background:#111;color:#fff;padding:.6rem 1rem;border-radius:8px;z-index:120"></p>
 
   <script>
-    const LS = "qr_magic_admin_token";
+    const LS = "qr_magic_session_token";
     const gate = document.getElementById("gate");
     const appEl = document.getElementById("app");
 
-    let adminToken = localStorage.getItem(LS) || "";
+    let sessionToken = localStorage.getItem(LS) || "";
+    let actor = null;
     let state = null;
     /** サーバー .env の PUBLIC_BASE_URL（https の観客用オリジン） */
     let publicBaseUrl = "";
@@ -193,13 +211,14 @@
     }
 
     function authHeaders() {
-      return { Authorization: "Bearer " + adminToken, "Content-Type": "application/json" };
+      return { Authorization: "Bearer " + sessionToken, "Content-Type": "application/json" };
     }
 
     async function api(path, opt = {}) {
       const r = await fetch(path, { ...opt, headers: { ...authHeaders(), ...opt.headers } });
       if (r.status === 401) {
         localStorage.removeItem(LS);
+        sessionToken = "";
         location.reload();
         throw new Error("unauthorized");
       }
@@ -227,8 +246,10 @@
       document.getElementById("settingsDrawer").classList.add("settingsDrawer--open");
       document.getElementById("btnOpenSettings").setAttribute("aria-expanded", "true");
       document.getElementById("settingsBackdrop").setAttribute("aria-hidden", "false");
+      renderAdminCodePanel();
       loadActiveTicketUrlsIntoDrawer();
       loadTicketHistoryIntoDrawer();
+      loadAdminCodesIntoDrawer();
     }
 
     function closeSettingsDrawer() {
@@ -236,6 +257,15 @@
       document.getElementById("settingsDrawer").classList.remove("settingsDrawer--open");
       document.getElementById("btnOpenSettings").setAttribute("aria-expanded", "false");
       document.getElementById("settingsBackdrop").setAttribute("aria-hidden", "true");
+    }
+
+    function isAdminActor() {
+      return actor && actor.role === "admin";
+    }
+
+    function renderAdminCodePanel() {
+      const panel = document.getElementById("adminCodePanel");
+      panel.style.display = isAdminActor() ? "block" : "none";
     }
 
     async function loadActiveTicketUrlsIntoDrawer() {
@@ -259,6 +289,56 @@
         ta.value = paths.map((p) => base + p).join("\n");
       } catch (e) {
         meta.textContent = "";
+        toast(String(e.message || e));
+      }
+    }
+
+    async function loadAdminCodesIntoDrawer() {
+      if (!isAdminActor()) return;
+      const meta = document.getElementById("adminCodeMeta");
+      const ta = document.getElementById("adminCodeList");
+      meta.textContent = "読み込み中…";
+      ta.value = "";
+      try {
+        const d = await api("/api/admin/codes");
+        const rows = Array.isArray(d.codes) ? d.codes : [];
+        meta.textContent = "総ID数 " + rows.length + "（管理者IDを含む）";
+        ta.value = rows
+          .slice()
+          .reverse()
+          .map((r) => `${r.id}  ${r.role === "admin" ? "管理者" : "ユーザー"}  ${r.active ? "有効" : "停止"}`)
+          .join("\n");
+      } catch (e) {
+        meta.textContent = "";
+        toast(String(e.message || e));
+      }
+    }
+
+    async function issueCodesBulk() {
+      const n = parseInt(document.getElementById("adminIssueCount").value, 10);
+      if (!Number.isFinite(n) || n < 1 || n > 5000) return toast("発行数は1〜5000");
+      try {
+        const d = await api("/api/admin/codes/bulk", { method: "POST", body: JSON.stringify({ count: n }) });
+        const ids = Array.isArray(d.ids) ? d.ids : [];
+        toast(ids.length + "件発行しました");
+        const ta = document.getElementById("adminCodeList");
+        ta.value = ids.join("\n") + (ta.value ? "\n" + ta.value : "");
+        loadAdminCodesIntoDrawer();
+      } catch (e) {
+        toast(String(e.message || e));
+      }
+    }
+
+    async function revokeCodeById() {
+      const id = String(document.getElementById("adminRevokeCode").value || "").trim();
+      if (!/^\d{8}$/.test(id)) return toast("8桁IDを入力してください");
+      if (!confirm(id + " を停止します。よろしいですか？")) return;
+      try {
+        await api("/api/admin/codes/revoke", { method: "POST", body: JSON.stringify({ id }) });
+        toast("停止しました");
+        document.getElementById("adminRevokeCode").value = "";
+        loadAdminCodesIntoDrawer();
+      } catch (e) {
         toast(String(e.message || e));
       }
     }
@@ -392,6 +472,7 @@
     async function load() {
       const data = await api("/api/state");
       publicBaseUrl = typeof data.publicBaseUrl === "string" ? data.publicBaseUrl.trim() : "";
+      actor = data.actor || null;
       state = data.state;
       renderAll();
     }
@@ -479,17 +560,32 @@
       if (isSettingsDrawerOpen()) loadTicketHistoryIntoDrawer();
     };
     document.getElementById("btnDownloadQrZip").onclick = () => downloadTicketQrsZip();
+    document.getElementById("btnAdminIssueCodes").onclick = () => issueCodesBulk();
+    document.getElementById("btnAdminRefreshCodes").onclick = () => loadAdminCodesIntoDrawer();
+    document.getElementById("btnAdminRevokeCode").onclick = () => revokeCodeById();
 
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && isSettingsDrawerOpen()) closeSettingsDrawer();
     });
 
-    document.getElementById("gateBtn").onclick = () => {
-      const v = document.getElementById("gateToken").value.trim();
-      if (!v) return toast("トークンを入力してください");
-      adminToken = v;
-      localStorage.setItem(LS, adminToken);
-      startApp();
+    document.getElementById("gateBtn").onclick = async () => {
+      const id = document.getElementById("gateToken").value.trim();
+      if (!/^\d{8}$/.test(id)) return toast("8桁のログインIDを入力してください");
+      try {
+        const d = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id }),
+        }).then((r) => r.json());
+        if (!d.ok || !d.token) {
+          return toast(d.message || "ログインに失敗しました");
+        }
+        sessionToken = d.token;
+        localStorage.setItem(LS, sessionToken);
+        startApp();
+      } catch (e) {
+        toast(String(e.message || e));
+      }
     };
 
     document.getElementById("saveBtn").onclick = () => save();
@@ -568,16 +664,17 @@
         startPublicUrlPoller();
       } catch (e) {
         localStorage.removeItem(LS);
-        adminToken = "";
+        sessionToken = "";
+        actor = null;
         gate.style.display = "block";
         appEl.style.display = "none";
         setSettingsFabVisible(false);
         closeSettingsDrawer();
-        toast("読み込み失敗: トークンを確認してください");
+        toast("読み込み失敗: IDを確認してください");
       }
     }
 
-    if (adminToken) startApp();
+    if (sessionToken) startApp();
 
     (function loadAppVersion() {
       fetch("/api/version")
